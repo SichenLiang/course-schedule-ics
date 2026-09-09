@@ -1,0 +1,33 @@
+# --- your settings, not the project's -------------------------------------
+# The parser's config and the publishing settings describe YOUR course and
+# YOUR machine. The templates (config.example.ini, publish.example.conf) are
+# committed; the copies you edit are not.
+course-schedule.ini
+publish.conf
+
+# --- run artifacts --------------------------------------------------------
+# Regenerated on every run, never a source of truth.
+live/
+out/
+*.tmp
+
+# Scheduled-run logs. run.sh rotates publish.log at LOG_MAX into publish.log.1
+# and drops anything older; neither belongs in the repo.
+logs/
+
+# The plist install.sh generates from launchd/agent.plist.template. The
+# template is committed; the generated file names your paths and your label.
+launchd/*.plist
+
+# tests/fixtures/ is deliberately NOT ignored. Those two recorded pages are
+# what makes the test suite hermetic (zero network), so they are committed.
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+.DS_Store

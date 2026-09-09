@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Template. install.sh substitutes @LABEL@, @REPO@, @PATH@ and @HOURS@ and
+    writes the result to ~/Library/LaunchAgents/@LABEL@.plist. Do not install
+    this file directly; the placeholders are not valid values.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>@LABEL@</string>
+
+    <!-- ProgramArguments must be an array. Each element is passed through as
+         one argument with no shell word-splitting, so a repository path with a
+         space in it survives. Collapsing it into a single Program string would
+         split it at the space. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@REPO@/launchd/run.sh</string>
+    </array>
+
+    <!-- launchd starts jobs in / unless told otherwise. -->
+    <key>WorkingDirectory</key>
+    <string>@REPO@</string>
+
+    <!-- launchd does not inherit a login shell's PATH. Without this the job
+         cannot find git, gh or python3. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>@PATH@</string>
+    </dict>
+
+    <!-- StartCalendarInterval rather than StartInterval, for two reasons: the
+         times are predictable, so when something breaks you know which stretch
+         of log to read; and if the Mac is asleep through a window, launchd
+         fires the missed job once on wake, whereas StartInterval merely
+         restarts its countdown. -->
+    <key>StartCalendarInterval</key>
+    <array>
+@HOURS@
+    </array>
+
+    <!-- Off on purpose. Loading a job should not have side effects, and this
+         job's side effect is pushing to the public internet -- from a login
+         moment when the network may not be up yet. To run it now, say so:
+             launchctl kickstart -k gui/$(id -u)/@LABEL@ -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- A backstop. run.sh appends to the log by path (so its own rotation is
+         safe); these two descriptors catch what launchd says when run.sh
+         itself fails to start. The directory must already exist or the job
+         will not load -- install.sh creates it. -->
+    <key>StandardOutPath</key>
+    <string>@REPO@/logs/publish.log</string>
+    <key>StandardErrorPath</key>
+    <string>@REPO@/logs/publish.log</string>
+</dict>
+</plist>

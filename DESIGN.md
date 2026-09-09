@@ -1,0 +1,937 @@
+# course-schedule-ics — design record
+
+Every decision below is paired with the alternatives that were rejected and
+why. Where a rule exists because of something observed on the real pages, the
+observation is quoted.
+
+Scope: scrape one or more public course pages named in a config file, emit one
+`.ics` file, and make any failure loud. Nothing writes to a calendar server;
+the `.ics` is the deliverable.
+
+The observations quoted throughout come from the two pages recorded in
+`tests/fixtures/` — a Google Sites course site with a lecture schedule and an
+assignments table. That course is the worked example, not the target: nothing
+about it is compiled in. See §15.
+
+---
+
+## 1. Zero dependencies, standard library only
+
+**Decision.** No `pip install`, ever. HTML parsing, iCalendar generation, HTTP
+and date handling are all hand-rolled on the standard library.
+
+**Why.** The same checkout has to run unchanged on two interpreters that are
+five years apart:
+
+| | Python |
+|---|---|
+| the old end | 3.9.6 — a macOS system interpreter, not upgradable without disturbing the machine |
+| the new end | 3.14 — a current Linux box |
+
+A dependency has to satisfy both. That means either a wheel built for 3.9 *and*
+3.14 on two different platforms, or a source build with a compiler. Either way
+the script acquires a way to break that has nothing to do with the course
+schedule — and it breaks on the day a deadline moves, which is the one day it
+must not.
+
+The language floor is therefore 3.9: no `match`, no `X | Y` type unions, no
+`dict | dict`, no `datetime.UTC`. Nothing newer than 3.9 appears in the source.
+The upper bound matters too — `datetime.utcnow()` is deprecated in 3.12+ and is
+avoided in favour of `datetime.now(timezone.utc)`.
+
+**Rejected: BeautifulSoup / lxml.** lxml is a C extension; its wheel
+availability lags new interpreters by months. BeautifulSoup would pull in a
+parser anyway. And the parsing problem here turned out to be a *whitespace*
+problem (§3), which a DOM library does not solve for free.
+
+**Rejected: the `icalendar` package.** RFC 5545 output for this feature set is
+about 60 lines: escape five characters, fold at 75 octets, emit `VEVENT` and
+`VALARM`. Writing it costs less than owning the dependency, and the folding
+rule is exactly the sort of thing worth having a test for regardless.
+
+**Rejected: `requests`.** `urllib.request` already does conditional GET,
+custom headers and timeouts. `requests` would add nothing this script uses.
+
+**Rejected: `python-dateutil`.** Its fuzzy parser is precisely the wrong tool.
+`dateutil.parser.parse("Chapter 17", fuzzy=True)` returns a date. The whole
+value of the parser here is *refusing* things (§5), and a permissive parser
+would have to be fought rather than used.
+
+**Rejected: `html.parser.HTMLParser` from the stdlib.** Considered, since it
+is free of the dependency objection. Rejected because Google Sites emits
+unbalanced and duplicated markup that sends a strict-ish event parser off the
+rails, while the regex pipeline in `extract.py` only has to answer one
+question: does this tag imply a line break? See §3.
+
+---
+
+## 2. The year bug — where a year actually comes from
+
+**The handoff spec was wrong.** It stated that the pages carry no years, and
+so a `SemesterAnchor` was built to infer one from a month (Aug–Dec →
+`fall_year`, Jan–May → `fall_year + 1`).
+
+**Observed reality.** Every left-hand date on both pages is written with its
+year:
+
+```
+Sep. 02, 2026 Introduction, History, and Architectures
+Oct. 05, 2026 Sampling Based Algorithms II
+```
+
+Only the trailing deadlines are yearless — `... Assignment 1 - Robot Building
+Due Sep. 13`. So 36 of the 42 records have a year printed on the page and 6 do
+not.
+
+The consequence of believing the spec was not a wrong output today (the anchor
+happens to agree with the page for this term) but a **silent** wrong output
+later: an anchor configured for the wrong term would have quietly overridden
+dates the page states outright, and nothing would have said so.
+
+**Decision — the page is the primary source, the anchor is a fallback:**
+
+1. A year written on the page is used, always.
+2. Only a date with no year consults the `SemesterAnchor`.
+3. If the two disagree, **the page still wins**, but the record is downgraded
+   to `uncertain` with a reason naming both years. Exactly one of the two is
+   wrong and the text cannot say which, so a human decides.
+4. No year on the page and a month the anchor does not cover (June, July) →
+   the hit is dropped. We never guess.
+
+Both branches now state their provenance in `reasons`, so `state.json` and the
+event description always answer "where did this year come from?":
+
+```
+year 2026 taken from the page
+year absent from the page; filled 2026 from semester anchor 'fall-2026'
+```
+
+**Rejected: delete the anchor now that the page has years.** The six deadlines
+have no year at all. Something must supply one.
+
+**Rejected: let the anchor win a conflict.** The anchor is a hand-configured
+constant; the page is the source of truth being scraped. A local constant that
+can silently override the source it is scraping is the exact failure mode this
+section exists to fix.
+
+**Rejected: drop conflicting records entirely.** A missing deadline is worse
+than a flagged one. The tool's whole bias is to surface doubt rather than
+delete it (§4).
+
+**Rejected: inherit the year from the sibling date on the same line.**
+Tempting — `Sep. 09, 2026 ... Due Sep. 13` obviously means 2026. It breaks at
+the year boundary: a December assignment due in January would inherit the wrong
+year, and that is precisely the case a student cannot afford to get wrong. The
+anchor's month→year table handles the roll-over correctly by construction.
+
+**Rejected: "the next Sep 13 after today".** Not reproducible. The same input
+would produce different output depending on when the script ran, which makes
+the diff report meaningless and the tests date-dependent.
+
+### 2b. The regex had to tolerate tag-injected whitespace
+
+The same bug has a lexical half. Google Sites splits one date across several
+`<span>`s, and whatever whitespace sat between the tags survives the tag
+removal. The identical logical date arrives as any of:
+
+```
+Sep. 02, 2026    Sep . 02 , 2026    Oct .05,2026    Oct .   05 , 2026
+```
+
+The old separator `(?:\.\s*|\s+)` required the period to touch the month, so
+`Sep . 02, 2026` matched **nothing**. Now every separator is `\s*`-tolerant on
+both sides: `(?:\s*\.\s*|\s+)`.
+
+This costs no precision. Whitespace *before* a period does not occur in
+ordinary prose, so the looser pattern accepts no English sentence that the
+stricter one rejected. The false-positive guards of §5 are re-tested against
+the spaced-out forms to prove it.
+
+---
+
+## 3. HTML → text: the one rule that mattered
+
+When deleting a tag, insert a newline for a **block** tag and **nothing at all**
+for an inline tag.
+
+A real row on the lectures page is:
+
+```html
+<span>Oct</span><span>. 0</span><span>5</span><span>, 2026</span>
+```
+
+The obvious `re.sub('<[^>]+>', ' ', html)` yields `Oct . 0 5 , 2026` — the day
+is split into two numbers and no date regex can recover it. That single
+whitespace decision was the difference between finding **6 of 30** lecture
+dates and finding **30 of 30**.
+
+**Rejected: strip tags to spaces and normalise afterwards.** Collapsing
+`0 5` back to `05` is indistinguishable from collapsing two genuinely separate
+numbers. The information is destroyed at strip time; it cannot be restored.
+
+---
+
+## 4. Three tiers of confidence
+
+| Tier | What happens |
+|------|--------------|
+| **dropped** | Never becomes a record at all. No date, an impossible day, a false-positive trap, or a year that cannot be resolved. |
+| **uncertain** | Emitted as a normal `VEVENT`, `SUMMARY` prefixed `[?]`, with every reason listed in the `DESCRIPTION`. |
+| **certain** | Emitted plain. |
+
+The middle tier is the point of the design. On the current pages it catches
+`Labor Day - no class` and `Fall break - No class` — real calendar entries that
+a student wants to see, but not as ordinary lectures.
+
+Downgrade triggers, each with a test:
+
+- year conflict between page and anchor (§2)
+- a weekday name next to a date that does not match that date (§6)
+- negation or correction words: `not`, `instead of`, `moved to`,
+  `rescheduled`, `cancelled`/`canceled`, `postponed`, `no class`, `TBD`/`TBA`,
+  `subject to change`
+- a relative expression in the same context: `next week`, `end of the semester`
+- a second, uncued date on a line that already has one
+- a lowercase `may` with nothing corroborating it (see §5)
+
+**Rejected: two tiers (keep or drop).** Silently dropping a real deadline is
+the worst outcome this tool can produce. Anything doubtful is emitted and
+labelled instead.
+
+**Rejected: a numeric score (0.0–1.0).** A number is not actionable. `0.62`
+does not tell a reader what to check. A list of sentences does, and it is what
+lands in the event description.
+
+**Rejected: dumping uncertain records to a side file for review.** A file
+nobody opens is the same as dropping them. Putting `[?]` in the calendar the
+user already looks at is the only placement that gets read.
+
+**A drop is reported; a trap is not.** The distinction is whether a human
+meant to publish a date there. `Feb. 30` and `Sep. 32` are both typos over a
+real deadline, so both are named on the run log, with the fragment and the
+line it came from. `Chapter 17` and `Room 315` were never dates and never will
+be; announcing them would put dozens of lines of noise on every run, which is
+how a report stops being read.
+
+The two typos used to be treated differently, for a reason that had nothing to
+do with either of them: an impossible **day** was filtered inside `_scan_dates`
+before the hit list was built, and `parse_line` returns early on an empty hit
+list — discarding the rejections along with it. So `Feb. 30`, caught one step
+later by `date()`, was reported, while `Sep. 32`, `Sep. 0` and `Sep. 99`
+vanished without a word. Impossible days are now carried out of the scan
+separately and go through the same reporting path.
+
+---
+
+## 5. False-positive exclusions, and where each came from
+
+Layer one: `DATE_RE` requires a month **name**, spelled correctly and ending
+there. Bare numerals cannot reach the parser at all, which disposes of most
+numeric noise for free.
+
+The "ending there" half was added after an audit. The pattern used to close the
+month with an open-ended `[a-z]*` tail, meant to accept `Sep|tember`. It also
+accepted `Aug|mented`, `Nov|el`, `Oct|omap`, `Dec|imal` and `Mar|ching` — and
+because the tail sat outside the capture group, it ate the front of the title
+too:
+
+| Line on the page | What the parser produced |
+|------------------|--------------------------|
+| `Augmented 3D perception lab` | `2026-08-03` — `D perception lab` — `certain` |
+| `Novel 3D printing` | `2026-11-03` — `D printing` — `certain` |
+| `Octomap 2 tutorial` | `2026-10-02` — `tutorial` — `certain` |
+
+On a robotics course whose real schedule already contains a row called `Novel
+Robot MP`, "Novel 3D Printing for Robots" would have added a thirteenth lecture
+that does not exist — at `certain`, the tier the reader is told to trust. A
+month name is a closed vocabulary of 24 strings; the alternation is generated
+from `MONTH_TOKENS` so the set the regex accepts and the set the lookup
+understands cannot drift apart.
+
+Layer two: guards that reject a match a looser pattern would accept. Each of
+these is a string actually observed in course-page prose:
+
+| Observed | Rule |
+|----------|------|
+| `Chapter 17`, `Case 17.2` | `TRAP_PREFIX_RE` — a match preceded by `chapter`, `case`, `question`, `problem`, `section`, `figure`, `table`, `room`, `page`, `part`, `slide`, `unit`, `module`, `version`, `no.`, `#` … is rejected |
+| `Room 315`, `Room 804` | same rule (`room`, `rm`, `building`, `bldg`) |
+| `ECE-UY 2004`, `ROB UY 3303` | `COURSE_CODE_RE` — a match overlapping a `XXX-UY nnnn` code is rejected |
+| `6 Metrotech Center` | no month name → never matches |
+| `Copyright 2026 NYU` | no month name → never matches |
+| `Sep 2024` | `(?![\d:])` after the day — `2024` cannot be read as day 20 or day 2 |
+| `11:59` in prose | same negative lookahead; a clock is not a date |
+| `may 5 students attend` | lowercase `may` is a modal verb far more often than a month, so it is only `certain` when corroborated by an explicit year or a due cue |
+| `Augmented 3D`, `Novel 3D`, `Decimal 4` | `(?![A-Za-z])` after the month — a month name may not be the prefix of a longer word |
+
+A date-shaped fragment that is genuinely rejected is not the same as one that
+could not be resolved. Traps above are *not* dates and are silently excluded, as
+intended. A fragment that **is** a date and still produces no record —
+`Feb. 30, 2026 Assignment 9`, or a month no semester anchor covers — used to
+vanish just as quietly, which meant a real deadline could be missing from the
+calendar with exit 0 and not one word anywhere. Those are now collected and
+named on stderr, with the fragment, the line it came from, and the reason.
+
+Layer two is tested directly, not just through the end-to-end path, so it stays
+honest if layer one is ever loosened — which §2b just did.
+
+**Rejected: a stopword list of whole lines.** Brittle and endless. The traps
+are *positional* (a number after `Chapter`), not lexical.
+
+**Rejected: dropping anything that looks ambiguous.** Same reasoning as §4 —
+that is what the `uncertain` tier is for.
+
+---
+
+## 6. Weekday × date consistency check
+
+If a weekday name sits within 24 characters before a date, it is checked
+against the actual weekday of the resolved date. A mismatch downgrades the
+record and says so:
+
+```
+weekday conflict: text says Monday but 2026-09-02 is a Wednesday
+```
+
+**What it is for.** It is the only *independent* check available. A course page
+is edited by hand every term, and the commonest edit error is bumping a date
+without touching the weekday beside it. The page contains two statements of the
+same fact, and disagreement between them is evidence — evidence that is
+otherwise invisible to a parser that only reads the numeral.
+
+It is deliberately advisory. A mismatch never drops the record, because the
+weekday is as likely to be the stale half as the date is.
+
+---
+
+## 7. UIDs based on source + title + kind — never the date
+
+```
+unique key:    uid = sha256("<url>\0<title>\0<kind>")[:32] + "@course-schedule-ics"
+ambiguous key: uid = sha256("<url>\0<title>\0<kind>\0<date>")[:32] + "@course-schedule-ics"
+```
+
+**Why the date is excluded.** A UID is a calendar's identity for an event. If
+the date were in the hash, moving a lecture would produce a *different* UID,
+and the calendar would delete the old event and create a new one. The user
+loses anything attached to the original — their own notes, a snoozed alarm,
+their RSVP — and the `--diff` report would show "1 removed, 1 added" instead of
+the fact that actually matters: **this lecture moved**. With the date excluded,
+a moved date is an *update* to a stable event, which is what the calendar
+protocol is for.
+
+**Why the date comes back when the key is ambiguous.** Two rows can legitimately
+share `(url, title, kind)`: the recorded course really does have two `Project
+working session` lectures, on Dec 07 and Dec 09. The original scheme numbered the
+duplicates `#0`, `#1` … by sorted position, so the first took no suffix and the
+second took `#1`.
+
+An audit broke it, and the break was severe. Delete the Dec 07 row — the far
+likelier edit — and the Dec 09 row slides into position 0 and **inherits the
+deleted row's UID**. Every consequence is wrong:
+
+- the calendar *moves* the Dec 07 event to Dec 09 instead of deleting it;
+- `--diff` reports a reschedule that never happened;
+- the disappearance is reported under the wrong date (`Dec 09`, not `Dec 07`);
+- whatever the student attached to the real Dec 09 event — a reminder, a note,
+  a snooze — is silently transferred to a session that no longer exists.
+
+Position was fake stability. For rows that are otherwise indistinguishable, the
+**date is the identity**, so it goes in the hash. When the key identifies
+exactly one row — the overwhelmingly common case, and the one the paragraph
+above is about — nothing changes and a reschedule is still an in-place update.
+
+**The accepted cost.** A same-titled row that moves now reads as delete + add,
+and the first appearance of a second same-titled row rotates the original's UID
+once. Both are one-off, both are visible in `--diff`, and neither invents a
+fact. Deletion — more common, and actively deceptive under the old scheme — is
+correct. A `#N` tiebreaker still guarantees uniqueness if two ambiguous rows
+also share a date.
+
+**Rejected: a stable page anchor such as `Week 15` in the hash.** The obvious
+better answer, and it does not exist on this page: `Week 15` is its own text
+line and *both* `Project working session` rows sit under it. It would not
+disambiguate the only pair it was meant to disambiguate.
+
+**Rejected: remembering in `state.json` which keys were once ambiguous**, so
+that the survivor of a deletion keeps its date-qualified UID. It removes the
+last rotation, at the price of making a UID depend on run history: a fresh
+clone would emit different UIDs from an incremental run for the same page.
+Reproducibility is worth more than one avoided rotation.
+
+**Rejected: a random UUID per event.** Not reproducible. Every run would
+republish the entire calendar as new events.
+
+**Rejected: hashing the raw source line.** A typo fix on the page would rotate
+the UID and duplicate the event.
+
+**Known consequence.** `kind` is in the hash, so §8's rename rotated the UID of
+the six release-date events exactly once. They appear as six removals plus six
+additions in that one run, and are stable from then on. This was accepted as a
+one-off cost, taken now while the calendar has no subscribers.
+
+---
+
+## 8. `kind`: naming both halves of an assignment
+
+The assignments page states its own convention:
+
+> Assignments begin on the dates listed left, and are due via Brightspace at
+> 11:59PM EST on the day listed below right.
+
+So each assignment row carries **two** dates with different meanings. The
+uncued left-hand date was previously labelled `kind: unknown` (6 records) — a
+placeholder that told the reader nothing, on a page that had already explained
+itself.
+
+**Decision.** Four kinds:
+
+| kind | meaning | ICS `SUMMARY` | time |
+|------|---------|---------------|------|
+| `lecture` | a class meeting | *(title only)* | all-day |
+| `assignment_out` | the day it is handed out | `ASSIGNED: <title>` | all-day |
+| `assignment_due` | the deadline | `DUE: <title>` | 23:59 |
+| `unknown` | retained for a source whose convention is not established | *(title only)* | all-day |
+
+The prefixes are load-bearing, not decoration. The release and the deadline of
+one assignment share a title and land in the same calendar about a fortnight
+apart; two bare `Assignment 3 - Trajectory Following` entries on different days
+are worse than no entry at all. `CATEGORIES` carries the same distinction for
+anything filtering programmatically.
+
+`unknown` is kept rather than deleted so that a future source with no stated
+convention degrades honestly instead of being mislabelled `assignment_out`.
+
+### Recognising a due cue and deleting one are two different decisions
+
+One regex answered both, and widening it for the first broke the second.
+
+*Recognising* asks: does the text just before this date mean the date is a
+deadline? Getting it wrong costs the deadline its `DUE:` prefix and its 23:59,
+leaving an all-day event indistinguishable from a release date. So the
+vocabulary is deliberately wide — a page that renames its "Due" column to
+"Submission" has not stopped having deadlines.
+
+*Deleting* asks: is this trailing word the name of the item, or a pointer at
+the next date on the line? Getting it wrong truncates a real title — and the
+title is hashed into the UID, so a truncation also **rotates the UID**, and the
+calendar deletes the event and creates a new one in its place. That is a silent
+loss with a knock-on effect; the recognition error is a visible one.
+
+The two lists were shared, so widening the first widened the second, and real
+titles disappeared into it:
+
+| line | title produced |
+|------|----------------|
+| `Lab report submission` | `Lab report` |
+| `Assignment Hand-in` | `Assignment` |
+| `Project handed in` | `Project` |
+| `How to Submit` | `How to` |
+
+They are now two regexes. `DUE_CUE_RE` recognises and stays wide;
+`TRAILING_CUE_RE` deletes and is a strict subset of it, in which everything
+except `due` and `deadline` must be followed by a preposition or qualifier —
+`submission by`, `handed in on` — because that is exactly what separates an
+instruction pointing at a date from a noun ending a title. A bare `Submit` is a
+title; `Submit by` is a cue. Recognising more than we delete costs nothing;
+deleting more than we recognise costs a title.
+
+**The residual cost, stated plainly.** `Assignment 1 Submission Sep. 13` keeps
+`Submission` in its title, because that line and `Lab report submission` are
+textually the same shape and nothing in the text distinguishes them. One of the
+two has to lose; the one that loses visibly is the right one. The deadline is
+still recognised, timed and prefixed either way, and both records on the line
+keep the same title, so the UID stays stable.
+
+**Rejected: `assignment_start`.** "Start" suggests the student begins work
+then. The page says the assignment *is released* then.
+
+**Rejected: one event spanning release → deadline.** A multi-day all-day block
+across two weeks buries every lecture underneath it in month view, and the
+alarm can only fire at one end.
+
+**Rejected: dropping the release dates.** They are on the page and they are
+useful — they are when the material becomes available.
+
+---
+
+## 9. Times and time zones
+
+Deadlines with no explicit time get `23:59`, from the page's own "11:59PM EST"
+sentence. `DTSTART` carries `TZID=America/New_York`, and the file ships the
+`VTIMEZONE` that defines it.
+
+**This reverses the original decision.** `DTSTART` used to be floating local
+time — no `TZID`, no `Z` — on the reasoning that a reminder should fire at
+23:59 wherever the student is. That reasoning does not survive contact with
+what a deadline *is*. A lecture is a wall-clock appointment; a submission
+cutoff is a fixed instant on someone else's clock. Floating time put a student
+in Los Angeles at 23:59 Pacific — **three hours after the real cutoff had
+already passed**, with the reminder arriving on time for an event that was
+over. Being an hour off for a traveller is a nuisance; being late for the one
+thing the tool exists to prevent is a failure of the tool.
+
+**The offsets are not the page's words.** The page says "11:59 PM EST", but the
+US rule has run second-Sunday-March to first-Sunday-November since 2007, so a
+September deadline in New York is **EDT (UTC-4)** and a December one is EST
+(UTC-5). Hardcoding either offset is wrong for half the semester. Naming the
+zone and shipping both rules gets every date right, and a test reads the rules
+back against the real tz database.
+
+**Why the earlier objection no longer holds.** The concern was that clients
+have opinions about foreign `VTIMEZONE` blocks. The block shipped here is the
+rule-based (`RRULE`) form that Google and Apple emit for themselves, not a
+transition table. Its `;` separators are structured syntax and deliberately do
+**not** pass through `escape()`, which is for TEXT properties only.
+
+**Degradation, not a dangling reference.** `cfg.timezone` must be a key of
+`ics.VTIMEZONES`. An unrecognised zone falls back to floating time rather than
+emitting a `TZID` the file never defines, and `cfg.timezone = ""` selects
+floating deliberately. All-day events are untouched: a lecture on a date has no
+time of day to convert.
+
+**Rejected: converting to UTC.** The deadline would display as some arbitrary
+local hour, which reads as a bug to the user.
+
+Release dates and lectures are all-day `VALUE=DATE` events with the RFC-correct
+exclusive `DTEND` (next day).
+
+---
+
+## 10. Failure = non-zero exit code
+
+```
+0  success
+1  unexpected internal error
+2  fetch failure (network error, or HTTP other than 200/304)
+3  parsed zero records, from any single source or overall
+4  record count collapsed by more than the threshold, per source or overall
+5  could not write the output files
+6  a 304 blocked a re-parse the options had made necessary
+```
+
+**A code names what to do, not merely what happened.** Two failures whose
+responses are opposite may not share a code. 2 and 6 did. Code 2 says the
+network or the site is the problem — check connectivity, check the URLs. Code 6
+fires when a page answers `304 Not Modified` to a request that deliberately
+carried no validator, which means the fetch worked perfectly and the fix is on
+the user's own disk: delete `state.json`. Sending that reader to inspect a
+connection that had demonstrably just worked wasted their time in the one
+situation where the tool knew exactly what was wrong. README made it stranger
+still by defining code 2 as "HTTP other than 200/304" — for a failure that can
+only fire on receiving a 304.
+
+**Why an exit code.** Silent failure is the worst outcome for a reminder tool.
+A calendar that quietly stops updating looks exactly like a calendar with
+nothing new in it — the user finds out by missing a deadline. An exit code is
+the one signal every scheduler already understands: cron mails it, systemd
+marks the unit failed, `launchd` records it, a shell `&&` stops. No
+configuration, no credentials, no extra moving part.
+
+Codes 3 and 4 exist because "the page layout changed" and "the site is gated"
+both present as a *successful* fetch of a page with no dates in it. Without the
+guard the tool would cheerfully overwrite a good calendar with an empty one.
+
+**The guard is per source, not only on the total.** It used to look at one
+number: how many records the run produced altogether. The assignments page
+carries all 12 deadlines out of 42 records — **28.6%** — so it could return
+nothing whatsoever and the total still fell short of the 50% global threshold.
+The run exited 0, republished the calendar, and every deadline in it
+disappeared without a word. The thing this tool exists to deliver is a minority
+of what it counts, so a number about the whole cannot protect a part. Each
+source now fails on its own if it produces no records at all (code 3), or
+collapses past `max_source_shrink_ratio` (code 4); the global guard runs
+afterwards, unchanged. Per-source counts live in `state.json` under
+`sources[url].record_count`, and a state file written before that field existed
+recovers its baseline by counting the stored records, so the guard is live on
+the very first run after the upgrade.
+
+**Zero is a failure with or without a baseline.** The per-source check began as
+`if not before: continue` — no history, nothing to compare against, carry on —
+and that exempted precisely the situation the guard is for. On a **first run**,
+whether on a new machine or one where `state.json` was just deleted (the
+documented way to reset), every baseline is zero. So a page that happened to be
+gated that morning yielded a calendar containing not one deadline, at exit 0.
+And the zero it then stored excused the next run, and the one after: three
+consecutive empty runs, all exit 0. A guard that only protects a source which
+has already succeeded once protects nobody at the moment of setup, which is the
+moment a scrape is most likely to be misconfigured.
+
+The audit offered two fixes: declare "expected non-empty" per source in the
+config file, or fail on zero regardless of history. **The second, because it
+needs nothing to be kept in sync.** A source has a `[source:...]` section because
+somebody put it there expecting dates on it; that is the declaration already,
+and "this page is allowed to be empty" is not a state this program can
+distinguish from "the scrape broke". A `may_be_empty` flag would only move the
+judgement into a setting that is written once and never revisited — and, like
+the `--force` flag rejected in §14, a switch that exists is a switch that ends
+up permanently on. If a source is legitimately empty, delete its section from
+the config; that is a conscious act, which is the point.
+
+The shrink comparison still skips a source with no baseline: an unknown past
+really is not evidence of a fall. Zero needs no past to be judged against.
+
+**Not every network failure is a URLError.** urllib wraps only the
+connect/request phase. A read timeout, a `RemoteDisconnected`, a reset — all
+raised after the connection is open — escaped the handlers, left a traceback
+and exited 1, which this table defines as "a bug in this program". A server
+hanging up is not a bug in this program, and the scheduler needs the same
+signal it gets for every other network failure. They are code 2.
+
+**Code 5 is new.** A full disk, a quota or a read-only directory is not an
+internal error, and sending the reader to look for a bug that is not there
+wastes their time.
+
+Code 5 used to carry a promise the other codes do not make — *neither* file
+was modified — and that promise was not always true. It holds for every
+failure to **write**, because both files are staged and `fsync`ed before
+either is renamed. It never held for the **rename** itself: replace
+`state.json` with a directory and `os.replace()` raises every time, after
+`schedule.ics` has already been swapped. The run printed "neither file was
+modified" anyway, left a `state.json.tmp` behind, and exited 5.
+
+The desync was the smaller half of that bug. Every guard in this program —
+codes 3, 4, the per-source checks, the parse signature — is built on the
+assumption that a bad run says so. An alarm that can be wrong *in the
+reassuring direction* is worse than no alarm, because it is believed. So the
+message is now derived from what actually happened rather than asserted in
+advance: nothing renamed yet says so, and a rename that fails after an earlier
+one succeeded prints which file holds this run's content, which still holds
+the previous run's, any staged copy that could not be removed, and how to get
+the two back in step.
+
+**Rejected: rolling back the renames that succeeded.** The previous content of
+a destination that has been `os.replace()`d is gone; a rollback that cannot
+restore it would be the same false all-clear one layer down.
+
+**On codes 2, 3, 4 and 6 the previous `schedule.ics` is left untouched** — a stale
+calendar is far better than an empty one — while `last_attempted_run` is
+updated and `last_successful_run` is preserved, so stderr can say how long it
+has been broken.
+
+**Rejected: a log file.** Nobody reads a log that has never had anything
+interesting in it.
+
+**Rejected: email / push notification on failure.** Needs credentials, an SMTP
+or API endpoint, and network access at exactly the moment the network is the
+thing that failed. The scheduler already has a working notification path.
+
+**Rejected: retrying automatically.** A layout change does not heal on retry;
+it just delays the alarm and hammers someone else's site.
+
+---
+
+## 11. Politeness and caching
+
+- `User-Agent` names the script, its purpose, its frequency and a contact
+  address. An anonymous scraper deserves to be blocked.
+- Minimum 1.0 s between requests.
+- `ETag` / `Last-Modified` are stored in `state.json` and replayed as
+  `If-None-Match` / `If-Modified-Since`. A `304` reuses the stored records and
+  parses nothing — the normal outcome between edits, and it costs the site
+  almost nothing.
+- Two pages, a few times a day. `robots.txt` is not fetched because this is a
+  hand-run personal tool over two known public URLs, not a crawler discovering
+  links.
+
+---
+
+## 12. Tests never touch the network
+
+`tests/__init__.py` replaces `socket.socket`, `socket.create_connection` and
+`socket.getaddrinfo` with functions that raise. Two tests assert that the block
+itself works.
+
+**Why enforce rather than promise.** "The tests don't use the network" is a
+claim that decays. A single accidental `HttpFetcher()` in a new test would make
+the suite slow, flaky, and dependent on a third party's uptime — and would
+quietly hit a live site on every run. Here it fails loudly instead.
+
+Ordering matters: `ssl` executes `class SSLSocket(socket.socket)` at import
+time, so `ssl`, `http.client` and `urllib.request` are imported *before* the
+patch goes in. Patching first breaks the import rather than the network.
+
+`tests/fixtures/*.html` are the real pages as fetched, committed verbatim
+(~290 KB). They are the only reason the suite is hermetic, so they are **not**
+gitignored, unlike `live/` and `out/`.
+
+**Rejected: hand-written miniature HTML fixtures.** The bugs in §2b and §3 are
+both *artifacts of real Google Sites markup*. A tidy hand-written fixture would
+not contain them, and the tests would pass while the tool failed.
+
+**Rejected: `unittest.mock.patch` on the fetcher.** Injection covers the code
+under test; the socket block covers the code nobody thought about.
+
+---
+
+## 13. Other choices worth recording
+
+- **The calendar and the state are written as one all-or-nothing step.**
+  `state.json` was atomic from the start (temp file + `os.replace`);
+  `schedule.ics` was not, and a write that failed partway truncated the good
+  calendar to whatever fitted — an audit produced 20480 bytes ending
+  mid-`VEVENT`, with 33 `BEGIN:VEVENT` against 32 `END:VEVENT` and no
+  `END:VCALENDAR`, unparseable by any subscriber. The two files are also one
+  fact split in half: a run that updated the calendar and then failed on the
+  state left them permanently out of step, so `--diff` re-reported the same
+  reschedule on every subsequent run. `state.write_files()` now stages, flushes
+  and `fsync`s every file before renaming any of them, so every failure to
+  *write* leaves both destinations untouched. The rename loop itself used to
+  run unguarded, on the theory that its only exposure was a crash *between*
+  two `os.replace()` calls — microseconds, closable only with a journal. That
+  was wrong. `os.replace()` can plainly fail: a destination replaced by a
+  directory raises `IsADirectoryError` every time, reproducibly, after the
+  earlier rename has already gone through. It is guarded now, the leftover
+  `.tmp` is cleaned up on that path too, and the failure is reported as what
+  it is rather than as the all-or-nothing case — see §10.
+- **A corrupt or missing `state.json` degrades to empty state** rather than
+  crashing. The consequence is one run reported entirely as `NEW`, which is
+  self-explanatory in the diff. This has to mean *structurally* corrupt, not
+  merely unparseable: `{"records": null}`, `{"records": 5}` and
+  `{"sources": "nope"}` are all valid JSON, and each used to crash several
+  modules away at exit 1 — the exact moment the tool most needs to still run.
+  Each field is validated on its own, so one bad key costs only that key, and
+  unrecognised keys are carried through untouched.
+  Validating the *containers* was not enough. `records` being a list said
+  nothing about what was in each record, and one mistyped field inside one row
+  still exited 1: `{"time": 5}` reached `rec.date + " " + rec.time` in
+  `_stamp` — on `--diff`, the command the README puts in its quick start —
+  while on the `304` path a non-string `time` reached `.split(":")`,
+  `{"date": null}` and mixed-type `date`/`title` reached the record sort,
+  `{"date": "junk"}` reached `date.fromisoformat`, and a non-string
+  `title`/`kind` reached the `join` inside `assign_uids`. `valid_record()`
+  now checks every field against the type its readers assume, at the loader
+  rather than in five modules, and drops the row that fails: one bad row costs
+  one row, exactly as one bad key costs one key. Exit 1 is reserved for a bug
+  in this program, and a hand-edited state file is not one.
+- **`state.json` records a parse signature** — the semester anchor, the default
+  due time, the sources' default kinds. A `304` skips parsing by design, but
+  `--fall-year` is applied *during* parsing, so a student starting a new
+  semester was told "304 Not Modified, no changes", exited 0, and kept a
+  calendar of last year's dates with nothing saying the flag had been ignored.
+  When the signature differs the conditional headers are dropped so the pages
+  come back in full; if a server answers 304 anyway, the run fails with code 6
+  rather than publish records it knows were parsed under different rules.
+  Code 6 rather than 2 because nothing about the fetch failed. `--alarm-days` is
+  deliberately *not* in the signature: it changes the ICS, not the parse.
+- **Everything tunable lives in `config.py`** — anchor, alarm lead, default due
+  time, shrink thresholds, calendar name, sources — and everything
+  course-specific among those comes from the config file rather than the
+  source. Nothing tunable is hardcoded elsewhere. See §15.
+- **Records are sorted by `(date, time, kind, title)`** before UID assignment,
+  so the output is byte-identical between runs apart from `DTSTAMP`. There is a
+  test for that.
+- **Kind constants live in `config.py`, not `parse.py`.** `parse` imports
+  `config`, so a source cannot name its default kind by constant unless the
+  constants sit in `config`. `parse` re-exports them, so
+  `from courseics.parse import KIND_LECTURE` still works.
+- **`VTIMEZONE` blocks live in `timezones.py`**, imported by both `config` and
+  `ics`. They were in `ics.py`, but the config loader has to validate a zone
+  name against the same table, and `ics` imports `config`; a third module is
+  cheaper than a lazy import inside a function.
+
+---
+
+## 14. Known limitations
+
+Found by audit, deliberately not fixed. Each is a real defect; each is here
+because the fix costs more than the defect, or because the fix is a product
+decision rather than a bug fix.
+
+### A retitled row is a delete plus an add
+
+The title is hashed into the UID, so correcting a typo on the page —
+`Sampling Based Algorithims` → `Sampling Based Algorithms` — rotates the UID.
+The calendar removes the event and creates a new one, and anything the student
+attached to the old one is lost.
+
+Not fixed because it is a genuine design tension, not an oversight. The
+alternatives all trade one loss for another: hashing the row's position brings
+back exactly the identity-theft bug of §7; hashing only the date makes a
+reschedule a delete-plus-add instead, which is the *more* common edit; fuzzy
+title matching guesses, and guessing is what this parser is built not to do.
+Which loss is preferable depends on how the calendar is actually used, and that
+is a decision to take deliberately with the person using it, not to slip in
+under a bug fix.
+
+**Consequence worth stating plainly:** because a shared UID implies a shared
+title, `format_diff` can only ever report a confidence change under
+`DETAILS CHANGED`. It used to carry a `title X -> Y` branch that no input could
+reach; that dead code has been removed rather than left to imply otherwise.
+
+### An item on both pages produces two events
+
+Deduplication is per source. A row that appears on the lectures page *and* the
+assignments page yields two `VEVENT`s with different UIDs. It is visible rather
+than silent — the reader sees the same title twice — and merging across sources
+needs a rule for whose title, kind and confidence wins when the two disagree,
+which is more machinery than the observed problem justifies. The real pages do
+not currently overlap.
+
+### Control bytes from the page reach the terminal and the ICS
+
+A page containing raw C0 control bytes (`\x1b`, `\x07`) passes them through
+`--list` to the terminal and into the `DESCRIPTION` field. RFC 5545 forbids
+them in text values. `escape()` neutralises the characters that matter
+structurally — `\`, `;`, `,`, CR and LF — so a control byte cannot forge a
+property or a component boundary; the worst outcome is a mangled description or
+a terminal escape sequence. Google Sites has never emitted one. Worth a
+`str.translate` pass if a real page ever does.
+
+The one property that did *not* go through `escape()` was `URL:`, which was
+written straight from `source_url`. It now goes through `uri_value()`, which
+percent-encodes control bytes rather than escaping them — `URL` is a URI value,
+not a TEXT value, and TEXT escaping would backslash the `,` and `;` that are
+legal URI characters. That path was never reachable (`source_url` comes from
+`cfg.sources`), but reachability is the half of a security argument that goes
+stale first.
+
+### The shrink guard has no override
+
+If a course legitimately halves its schedule — a page rewritten mid-semester,
+a summer term — the guard blocks every subsequent run and the only escape is to
+delete `state.json`, which also discards the diff baseline and the caching
+headers. A `--force` flag is the obvious fix and is deliberately absent: a flag
+that exists is a flag that gets added to the cron line, and then the guard
+protects nothing. Deleting `state.json` is a conscious act, which is the point.
+
+### The CRASHED handler is unreachable in normal use
+
+`__main__.py` calls `cli.main()` directly, so the top-level
+`except Exception -> "course-schedule-ics CRASHED"` guard at the bottom of `cli.py` only
+runs when `cli.py` is executed as a script. Both documented entry points miss
+it. It is three lines and harmless; wiring it into both entry points is a small
+tidy-up rather than a defect with a victim.
+
+### A corrupt `record_count` wedges the run at code 4
+
+`sources[url].record_count` is the baseline the per-source shrink guard
+measures against. It is validated as a non-negative integer, which is all a
+type check can do — a *plausible but wrong* number, `9999` where the truth is
+30, passes every check there is. The run then fails at code 4, every time,
+against a page that has not changed. The failure path deliberately does not
+rewrite `records` or the counts, so nothing self-corrects; the escape is to
+delete `state.json`, exactly as for the shrink guard above.
+
+Not fixed, because the fix is a way to overrule the guard, and §14's `--force`
+argument applies unchanged: a switch that exists is a switch that ends up in
+the cron line. Cross-checking `record_count` against the stored `records` was
+considered and rejected — it would make the two fields disagree silently
+instead of loudly, and `record_count` exists precisely so that a source whose
+records were never stored still has a baseline.
+
+What *was* fixed is the message. It used to name the page and only the page,
+sending the reader to audit a healthy site with no hint that the other number
+in the comparison came off their own disk. It now names the baseline, where it
+is stored, and that it may be the wrong half.
+
+### Two runs at once will collide over the `.tmp` files
+
+Every staged file is written to `<path>.tmp`, a fixed name. Two `course-schedule-ics`
+processes writing the same `--out-dir` at the same time will overwrite each
+other's staging file and can rename a half-written one into place. There is no
+lock.
+
+Not fixed. The tool is documented and designed as a once-or-twice-a-day cron
+job over two pages; a second concurrent run is not a thing that happens by
+accident. The fix is either a randomised suffix (which leaks a temp file on
+every crash instead of reusing one slot) or a lock file (which then needs stale
+detection, which needs a PID check, which is more machinery than the observed
+problem). Worth doing the moment anything schedules this more than once at a
+time.
+
+### The global shrink threshold is now redundant arithmetic
+
+With the per-source guard in place, the total is the sum of the parts: if no
+source has fallen by more than 50%, the total cannot have either — a weighted
+average is bounded by its largest term. So while the two thresholds hold the
+same value, the set of sources is unchanged, and every source has a baseline,
+`max_shrink_ratio` cannot fire on anything `max_source_shrink_ratio` has not
+already caught.
+
+Kept anyway, and not merely out of caution. Each of those three conditions is
+a thing that changes: the thresholds are separately tunable on purpose
+(someone who loosens the per-source bound for a page that churns still wants
+one on the whole calendar); adding or removing a source changes the
+composition of the total; and the global baseline is counted from the stored
+`records` while the per-source ones come from `record_count`, so they can
+disagree. It costs three lines and one comparison. Recorded here so a future
+reader does not mistake it for a second independent check that, on the current
+configuration, it is not.
+
+---
+
+## 15. Making it somebody else's course
+
+The parser began life pointed at one course, with the two URLs, the semester
+year, the calendar name and the time zone written into `config.py`. Everything
+course-specific now comes from a config file instead. That change was worth
+recording, because the tempting shortcuts are all worse.
+
+**The file format is INI, read with `configparser`.** TOML is the modern
+answer, and `tomllib` is in the standard library — from 3.11. This project's
+floor is 3.9 (§1), so TOML would mean either a dependency or a hand-written
+parser, and a hand-written TOML parser is a new source of silent
+misinterpretation in the one file whose misreading produces a plausible-looking
+wrong calendar. JSON is stdlib everywhere and was rejected for one reason: no
+comments. The settings here are ones a user reads once a semester and has to
+reason about — which year an undated deadline belongs to, what a page's dates
+mean — and the explanation belongs beside the value.
+
+**There is no default course, and no default `fall_year`.** A missing config
+file stops the run at exit 7 rather than falling back on anything. A default
+that is nearly right is worse than no default here: every setting in this file
+governs something that fails *plausibly*. A wrong `fall_year` produces a
+complete, well-formed calendar of dates twelve months out. A missing time zone
+produces deadlines that float. Neither looks like an error in a calendar app,
+which is exactly why neither is allowed to be guessed.
+
+**Validation happens at the boundary, not at the point of use.** `load_config`
+checks every value and names the file, the section and the key when it refuses.
+A time zone the tool has no `VTIMEZONE` for is rejected there — even though
+`ics.timezone_id()` would quietly degrade it to floating time — because a
+silent downgrade to floating is precisely the bug §9 exists to prevent, and a
+config file is the wrong place to discover it. The message lists the zones that
+do work; a rejection the reader cannot act on is only half a message.
+
+**Exit code 7, and argparse.** Adding a config file added a new class of
+failure: the run never started. It could not share code 2, which means "fetch
+failure, check the network" — nothing had been fetched. That also exposed an
+older wart: `argparse` exits 2 on a usage error, so a mistyped flag had been
+reporting itself as a network problem all along. `_Parser` overrides `error()`
+to exit 7 too.
+
+**Sources keep their file order.** `configparser` preserves section order, and
+that order decides which page is fetched first and how the log reads. Sorting
+them would make two runs of the same config look gratuitously different.
+
+**Two config files ship, and they are not interchangeable.**
+`config.example.ini` is the annotated template, and every URL in it is
+obviously fictional — nobody should publish a calendar of a stranger's lectures
+because they forgot to edit a line. `examples/recorded-course.ini` describes the
+two pages in `tests/fixtures/`; it is what the test suite loads and what makes
+`--offline` work out of the box. A test asserts that both still parse, because
+a shipped example that no longer loads is worse than none: it is the first
+thing a new user copies, and the error names their edit rather than our
+staleness.
+
+**The recordings are the real pages.** Replacing them with synthetic HTML would
+have made de-identification trivial and the tests worthless: the whitespace rule
+in §3 exists *because* of how Google Sites actually splits a date across
+`<span>` elements, and a fixture written by the same person who wrote the parser
+cannot falsify it. The one edit made to them is the instructor's name and email
+address in the page footer, replaced with a placeholder — a line that carries no
+date and produces no record, so nothing the tests assert on depends on it.
+
+**Publishing and scheduling are templates.** `deploy.sh` and `launchd/` read
+`publish.conf`, and the shipped `publish.example.conf` is a template. The
+`launchd` label, the schedule, the paths and the public repository are all
+settings; the plist is generated from `launchd/agent.plist.template` at install
+time rather than committed, because a committed plist is a file full of one
+person's paths that everyone else has to remember to edit.
+
+The one gate that could not be generalised by parameterising it is the privacy
+gate. Its allow-list of hostnames is *derived* from the source URLs in the
+parser config, so it cannot go stale when the config changes; anything
+institution-specific — the name of an LMS, the shape of a student ID — goes in
+`FORBIDDEN_PATTERNS`, where it is the user's own declaration of what must never
+reach the public web.

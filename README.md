@@ -219,16 +219,31 @@ with one `VALARM`.
   the parser thought otherwise.
 - `CATEGORIES` is the raw kind, for programmatic filtering.
 
-`UID`s are derived from source + title + kind and **not** the date, so a
-rescheduled lecture updates the existing event instead of creating a second
-one. Import or subscribe to the same file repeatedly and it stays one calendar.
+`UID`s are derived from the source, the kind, and **the half of (date, title)
+that that kind holds still**. Import or subscribe to the same file repeatedly
+and it stays one calendar.
 
-The one exception: when two rows share source + title + kind — the recorded
-course has two `Project working session` lectures — the date joins the UID for
-those rows, because it is the only thing that tells them apart. A consequence
-worth knowing: **renaming a row appears as a removal plus an addition**, and
-anything you attached to the old event is lost. See [`DESIGN.md`](DESIGN.md)
-§7 and §14.
+| kind | identified by | so this is an in-place update | and this replaces the event |
+|---|---|---|---|
+| `assignment_due`, `assignment_out`, `unknown` | source + **title** + kind | the deadline moves | the item is renamed |
+| `lecture` | source + **date** + kind | the session is retitled | the session moves to another day |
+
+An assignment is an artefact — `Assignment 2` rescheduled is still
+`Assignment 2`. A lecture is a slot — the 9 Sep session is the 9 Sep session,
+and its title is the instructor's running summary of what it will cover. The
+recorded course rewrote two lecture titles twice each in a single day; keyed on
+the title, that deleted and rebuilt both events both times.
+
+When either key does not identify exactly one row — two lectures on the same
+day, or two assignments sharing a title — the other half joins the UID for
+those rows, because it is the only thing that tells them apart. Those rows lose
+the guarantee in the third column above. See [`DESIGN.md`](DESIGN.md) §7
+and §14.
+
+> **Upgrading from an earlier version:** the lecture key changed, so on the
+> first run after upgrading, every existing **lecture** event is replaced once
+> and anything you attached to one is lost. Assignment events are unaffected —
+> they hash exactly what they hashed before. This is a one-off.
 
 ### `state.json`
 
@@ -449,7 +464,7 @@ calendar stays at its last good version.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests -t .          # 333 tests, well under a second
+python3 -m unittest discover -s tests -t .          # 362 tests, well under a second
 python3 -m unittest discover -s tests -t . -v       # verbose
 python3 -m unittest tests.test_parse_confidence     # one module
 ```
@@ -497,7 +512,7 @@ launchd/                    run deploy.sh on a schedule, and notice when it stop
   uninstall.sh              unload it and delete the plist
   run.sh                    what launchd runs: rotate, run, log, alert
   status.sh                 last success / recent failures / how many, in one line
-tests/                      333 tests + the two recorded pages
+tests/                      362 tests + the two recorded pages
 DESIGN.md                   why every one of these is the way it is
 ```
 
@@ -508,8 +523,11 @@ DESIGN.md                   why every one of these is the way it is
 [`DESIGN.md` §14](DESIGN.md) lists them in full, with the reasoning for leaving
 each one. The ones most likely to bite:
 
-- **Renaming a row is a delete plus an add**, because the title is hashed into
-  the UID. Anything you attached to the old event is lost.
+- **Renaming an assignment is a delete plus an add**, because an assignment is
+  identified by its title. So is **moving a lecture to another day**, because a
+  lecture is identified by its date. Anything you attached to the old event is
+  lost. Retitling a lecture and rescheduling an assignment are both in-place
+  updates.
 - **An item appearing on two of your pages produces two events.** Deduplication
   is per source.
 - **Two runs writing the same `--out-dir` at once will collide.** There is no

@@ -991,7 +991,11 @@ class TestOutputIsAllOrNothing(unittest.TestCase):
                      fetcher=StringFetcher({LEC: self.LEC_PAGE,
                                             ASG: self.ASG_PAGE}),
                      log=io.StringIO())
-            moved = {LEC: "<p>Oct. 05, 2026 Intro</p>", ASG: self.ASG_PAGE}
+            # The deadline moves, not the lecture: this test is about a diff
+            # repeating itself, and it needs an edit that reads as one event
+            # changing rather than two events swapping places.
+            moved = {LEC: self.LEC_PAGE,
+                     ASG: "<p>Sep. 09, 2026 A1 Due Sep. 20</p>"}
             with SabotagedWrite("state.json.tmp"):
                 with quiet_stderr():
                     main(["--out-dir", d], fetcher=StringFetcher(moved),
@@ -1296,7 +1300,9 @@ class TestCliOptions(unittest.TestCase):
         dues = [r for r in st["records"] if r["kind"] == "assignment_due"]
         self.assertEqual(dues[0]["date"], "2030-09-13")
 
-    def test_diff_mode_reports_a_moved_lecture(self):
+    def test_diff_mode_reports_a_moved_deadline(self):
+        # A deadline, because a deadline is the kind keyed by its title and so
+        # the kind for which a date change is a move rather than a new event.
         with TempDir() as d:
             main(["--out-dir", d],
                  fetcher=StringFetcher({LEC: "<p>Sep. 02, 2026 Intro</p>",
@@ -1305,13 +1311,50 @@ class TestCliOptions(unittest.TestCase):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 main(["--out-dir", d, "--diff"],
-                     fetcher=StringFetcher({LEC: "<p>Sep. 04, 2026 Intro</p>",
-                                            ASG: "<p>Sep. 09, 2026 A1 Due Sep. 13</p>"}),
+                     fetcher=StringFetcher({LEC: "<p>Sep. 02, 2026 Intro</p>",
+                                            ASG: "<p>Sep. 09, 2026 A1 Due Sep. 20</p>"}),
                      log=io.StringIO())
         report = buf.getvalue()
         self.assertIn("DATE CHANGED", report)
-        self.assertIn("2026-09-02", report)
-        self.assertIn("2026-09-04", report)
+        self.assertIn("2026-09-13", report)
+        self.assertIn("2026-09-20", report)
+
+    def test_diff_mode_reports_a_retitled_lecture(self):
+        with TempDir() as d:
+            main(["--out-dir", d],
+                 fetcher=StringFetcher({LEC: "<p>Sep. 02, 2026 Intro</p>",
+                                        ASG: "<p>Sep. 09, 2026 A1 Due Sep. 13</p>"}),
+                 log=io.StringIO())
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                main(["--out-dir", d, "--diff"],
+                     fetcher=StringFetcher({LEC: "<p>Sep. 02, 2026 Intro and History</p>",
+                                            ASG: "<p>Sep. 09, 2026 A1 Due Sep. 13</p>"}),
+                     log=io.StringIO())
+        report = buf.getvalue()
+        self.assertIn("DETAILS CHANGED", report)
+        self.assertIn("Intro and History", report)
+        self.assertNotIn("DISAPPEARED", report)
+        self.assertNotIn("NEW (", report)
+
+
+_MONTHS = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+           7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+
+
+def lectures_page(rows):
+    """A lectures page spelled the way the real recorded one spells its rows.
+
+    Takes (ISO date, title) pairs -- in practice the real page's own rows, read
+    back out of state.json, with only the field under test edited.
+    """
+    import datetime as dt
+    out = []
+    for date, title in rows:
+        day = dt.date.fromisoformat(date)
+        out.append("<p>%s. %02d, %d %s</p>"
+                   % (_MONTHS[day.month], day.day, day.year, title))
+    return "<html><body>%s</body></html>" % "".join(out)
 
 
 class TestRescheduledDeadlineKeepsItsUid(unittest.TestCase):
@@ -1370,48 +1413,247 @@ class TestRescheduledDeadlineKeepsItsUid(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(first), 3)
 
-    def test_shifting_the_whole_lecture_schedule_keeps_every_unique_uid(self):
-        """30 real rows, all one day later. Only the two twins may churn."""
-        import datetime as dt
-        months = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 8: "Aug",
-                  9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
-        with TempDir() as d:
-            with quiet_stderr():
-                main(["--out-dir", d],
-                     fetcher=FixtureFetcher({LEC: "lectures.html",
-                                             ASG: "assignments.html"},
-                                            base_dir=FIXTURES),
-                     log=io.StringIO())
-            stored = read_json(os.path.join(d, "state.json"))["records"]
-            lectures = [r for r in stored if r["source_url"] == LEC]
-            self.assertEqual(len(lectures), 30)
+    def _page(self, rows):
+        return lectures_page(rows)
 
-            rows = []
-            for r in lectures:
-                day = dt.date.fromisoformat(r["date"]) + dt.timedelta(days=1)
-                rows.append("<p>%s. %02d, %d %s</p>"
-                            % (months[day.month], day.day, day.year,
-                               r["title"]))
-            page = "<html><body>%s</body></html>" % "".join(rows)
-            asg = read_text(os.path.join(FIXTURES, "assignments.html"))
-            with quiet_stderr():
-                code = main(["--out-dir", d],
-                            fetcher=StringFetcher({LEC: page, ASG: asg}),
-                            log=io.StringIO())
-            after = read_json(os.path.join(d, "state.json"))["records"]
+    def _seed_from_the_real_pages(self, d):
+        with quiet_stderr():
+            main(["--out-dir", d],
+                 fetcher=FixtureFetcher({LEC: "lectures.html",
+                                         ASG: "assignments.html"},
+                                        base_dir=FIXTURES),
+                 log=io.StringIO())
+        stored = read_json(os.path.join(d, "state.json"))["records"]
+        return ([r for r in stored if r["source_url"] == LEC],
+                [r for r in stored if r["source_url"] == ASG])
+
+    def _replay(self, d, rows, argv=()):
+        asg = read_text(os.path.join(FIXTURES, "assignments.html"))
+        buf = io.StringIO()
+        with quiet_stderr(), contextlib.redirect_stdout(buf):
+            code = main(["--out-dir", d] + list(argv),
+                        fetcher=StringFetcher({LEC: self._page(rows),
+                                               ASG: asg}),
+                        log=io.StringIO())
+        return code, read_json(os.path.join(d, "state.json"))["records"], \
+            buf.getvalue()
+
+    def test_replaying_the_real_rows_unchanged_disturbs_nothing(self):
+        """The reconstruction is faithful, so the two tests below mean what
+        they say: any UID churn they see comes from the edit, not the rewrite.
+        """
+        with TempDir() as d:
+            lectures, _ = self._seed_from_the_real_pages(d)
+            self.assertEqual(len(lectures), 30)
+            code, after, _ = self._replay(
+                d, [(r["date"], r["title"]) for r in lectures])
+        self.assertEqual(code, EXIT_OK)
+        now = {r["uid"] for r in after if r["source_url"] == LEC}
+        self.assertEqual({r["uid"] for r in lectures}, now)
+
+    def test_retitling_every_lecture_keeps_every_lecture_uid(self):
+        """30 real rows, every slot given the previous slot's real title.
+
+        This is the 2026-09-09 edit at page scale: the dates stand still and
+        the subject matter slides between adjacent sessions. Under a title key
+        it was 30 deletions and 30 arrivals.
+        """
+        with TempDir() as d:
+            lectures, _ = self._seed_from_the_real_pages(d)
+            titles = [r["title"] for r in lectures]
+            rotated = [(r["date"], titles[i - 1])
+                       for i, r in enumerate(lectures)]
+            code, after, report = self._replay(d, rotated, ["--diff"])
 
         self.assertEqual(code, EXIT_OK)
         was = {r["uid"]: r for r in lectures}
         now = {r["uid"]: r for r in after if r["source_url"] == LEC}
-        kept = [u for u in was if u in now]
-        lost = sorted(was[u]["title"] for u in was if u not in now)
-        # Every row whose title identifies it keeps its UID and moves.
-        self.assertEqual(len(kept), 28)
-        for uid in kept:
-            self.assertNotEqual(was[uid]["date"], now[uid]["date"])
-            self.assertEqual(was[uid]["title"], now[uid]["title"])
-        # The only churn is the pair the date is part of the identity for.
-        self.assertEqual(lost, ["Project working session"] * 2)
+        self.assertEqual(set(was), set(now))
+        # 29 of the 30, because rotation hands the Dec 09 twin the Dec 07
+        # twin's identical title.
+        retitled = [u for u in was if was[u]["title"] != now[u]["title"]]
+        self.assertEqual(len(retitled), 29)
+        for uid in retitled:
+            self.assertEqual(was[uid]["date"], now[uid]["date"])
+        self.assertIn("DETAILS CHANGED (29)", report)
+        self.assertNotIn("DISAPPEARED", report)
+        self.assertNotIn("NEW (", report)
+
+    def test_shifting_every_lecture_by_a_day_rotates_every_lecture_uid(self):
+        """The accepted cost of the date key, at page scale and stated plainly.
+
+        A lecture is identified by its slot, so moving all 30 slots is 30 new
+        slots. Asserted rather than left to be discovered by a subscriber --
+        and asserted alongside the fact that it costs the DEADLINES nothing,
+        which is what keeps the damage bounded.
+        """
+        import datetime as dt
+        with TempDir() as d:
+            lectures, assignments = self._seed_from_the_real_pages(d)
+            shifted = [((dt.date.fromisoformat(r["date"])
+                         + dt.timedelta(days=1)).isoformat(), r["title"])
+                       for r in lectures]
+            code, after, _ = self._replay(d, shifted)
+
+        self.assertEqual(code, EXIT_OK)
+        was = {r["uid"] for r in lectures}
+        now = {r["uid"] for r in after if r["source_url"] == LEC}
+        self.assertEqual(was & now, set())
+        self.assertEqual(len(now), 30)
+        # The assignments page did not change, and nothing about the lecture
+        # key may reach it.
+        self.assertEqual({r["uid"] for r in assignments},
+                         {r["uid"] for r in after if r["source_url"] == ASG})
+
+
+class TestTheSeptember9Retitles(unittest.TestCase):
+    """The acceptance case: what the real page actually did on 2026-09-09.
+
+    Within one day the instructor rewrote a lecture title twice and moved its
+    subject matter to the following session:
+
+        01:00  Sep 02: "Introduction, History, and Architectures"
+                    -> "Introduction, History, and"
+               Sep 09: gains "Architectures"
+        13:00  Sep 02: -> "Introduction, and History"
+               Sep 09: -> "Architectures, Representations, Assignment Teams
+                           & Forms"
+
+    The pipeline noticed and published both times, and under a title-keyed
+    lecture each publish deleted two events and created two new ones -- twice
+    in one day, in a calendar people subscribe to. Worse, a tool comparing
+    titles cannot tell that shape apart from "one item vanished and an
+    unrelated one appeared", which is the single confusion this program is
+    built to prevent.
+
+    The replay starts from the real recorded page and edits only the two
+    titles the instructor edited.
+    """
+
+    SEP2 = ("Introduction, History, and Architectures",
+            "Introduction, History, and",
+            "Introduction, and History")
+    SEP9 = ("Coordinate Frames, Kinematics, Probability",
+            "Architectures, Coordinate Frames, Kinematics, Probability",
+            "Architectures, Representations, Assignment Teams & Forms")
+
+    def _seed(self, d):
+        with quiet_stderr():
+            main(["--out-dir", d],
+                 fetcher=FixtureFetcher({LEC: "lectures.html",
+                                         ASG: "assignments.html"},
+                                        base_dir=FIXTURES),
+                 log=io.StringIO())
+        return self._read(d)
+
+    def _read(self, d):
+        stored = read_json(os.path.join(d, "state.json"))["records"]
+        return stored, read_text(os.path.join(d, "schedule.ics"))
+
+    def _edit(self, rows, step):
+        out = []
+        for r in rows:
+            title = r["title"]
+            if r["date"] == "2026-09-02":
+                title = self.SEP2[step]
+            elif r["date"] == "2026-09-09":
+                title = self.SEP9[step]
+            out.append((r["date"], title))
+        return out
+
+    def _publish(self, d, rows):
+        asg = read_text(os.path.join(FIXTURES, "assignments.html"))
+        buf = io.StringIO()
+        with quiet_stderr(), contextlib.redirect_stdout(buf):
+            code = main(["--out-dir", d, "--diff"],
+                        fetcher=StringFetcher({LEC: lectures_page(rows),
+                                               ASG: asg}),
+                        log=io.StringIO())
+        stored, ics = self._read(d)
+        return code, stored, ics, buf.getvalue()
+
+    @staticmethod
+    def _unfolded(ics):
+        """ICS lines with continuations rejoined and DTSTAMP normalised."""
+        lines = []
+        # read_text() opens in text mode, so the CRLFs are already LFs here.
+        for raw in ics.replace("\r\n", "\n").split("\n"):
+            if raw.startswith(" ") and lines:
+                lines[-1] += raw[1:]
+            elif raw:
+                lines.append(raw)
+        return [ln for ln in lines if not ln.startswith("DTSTAMP:")]
+
+    def _run_the_day(self):
+        with TempDir() as d:
+            seeded, ics0 = self._seed(d)
+            lectures = [r for r in seeded if r["source_url"] == LEC]
+            steps = [(seeded, ics0, "")]
+            for step in (1, 2):
+                code, stored, ics, report = self._publish(
+                    d, self._edit(lectures, step))
+                self.assertEqual(code, EXIT_OK)
+                steps.append((stored, ics, report))
+        return steps
+
+    def test_no_uid_moves_across_either_retitle(self):
+        steps = self._run_the_day()
+        sets = [{r["uid"] for r in stored} for stored, _, _ in steps]
+        self.assertEqual(len(sets[0]), 42)
+        self.assertEqual(sets[0], sets[1])
+        self.assertEqual(sets[1], sets[2])
+
+    def test_the_two_slots_are_edited_in_place(self):
+        steps = self._run_the_day()
+        by_date = [{r["date"]: r for r in stored if r["source_url"] == LEC}
+                   for stored, _, _ in steps]
+        for date, titles in (("2026-09-02", self.SEP2),
+                             ("2026-09-09", self.SEP9)):
+            uids = {b[date]["uid"] for b in by_date}
+            self.assertEqual(len(uids), 1, date)
+            self.assertEqual([b[date]["title"] for b in by_date],
+                             list(titles), date)
+
+    def test_each_publish_reports_an_edit_not_a_replacement(self):
+        for _, _, report in self._run_the_day()[1:]:
+            self.assertIn("DETAILS CHANGED (2)", report)
+            self.assertNotIn("DISAPPEARED", report)
+            self.assertNotIn("NEW (", report)
+            self.assertNotIn("DATE CHANGED", report)
+
+    def test_the_report_names_the_title_it_replaced(self):
+        # An in-place edit is only useful to a reader who can see what it
+        # replaced; "the 9 Sep lecture is now called X" is the whole point.
+        _, second, _ = self._run_the_day()
+        self.assertIn(self.SEP2[0], second[2])
+        self.assertIn(self.SEP2[1], second[2])
+
+    def test_the_published_calendar_changes_only_the_two_summaries(self):
+        """At the wire level: same UIDs, and only text properties differ.
+
+        This is the assertion the observed damage calls for. The published
+        file must not rebuild events -- the churn has to be confined to the
+        fields that actually changed.
+        """
+        steps = self._run_the_day()
+        for (_, before, _), (_, after, _) in zip(steps, steps[1:]):
+            a, b = self._unfolded(before), self._unfolded(after)
+            self.assertEqual([ln for ln in a if ln.startswith("UID:")],
+                             [ln for ln in b if ln.startswith("UID:")])
+            churn = set(a) ^ set(b)
+            self.assertTrue(churn)
+            for line in churn:
+                self.assertTrue(
+                    line.startswith(("SUMMARY:", "DESCRIPTION:")),
+                    "a retitle rewrote %r" % line[:40])
+
+    def test_the_assignment_events_are_untouched_all_day(self):
+        steps = self._run_the_day()
+        sets = [{r["uid"] for r in stored if r["source_url"] == ASG}
+                for stored, _, _ in steps]
+        self.assertEqual(len(sets[0]), 12)
+        self.assertEqual(sets[0], sets[1])
+        self.assertEqual(sets[1], sets[2])
 
 
 class TestDuplicateRowDeletion(unittest.TestCase):
@@ -1453,13 +1695,37 @@ class TestDuplicateRowDeletion(unittest.TestCase):
         self.assertEqual([r["date"] for r in sessions], ["2026-12-09"])
 
     def test_an_unrelated_reschedule_is_still_an_update_not_a_replacement(self):
-        # The hardened core path, guarded end to end.
+        # The hardened core path, guarded end to end. The moving row is the
+        # deadline on the assignments page, because that is the kind whose
+        # identity is its title; a lecture is identified by its date.
+        LECTURES = "<p>Dec. 07, 2026 Sampling Based Algorithms</p>"
+
+        def run(due, argv=()):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                main(["--out-dir", d] + list(argv),
+                     fetcher=StringFetcher(
+                         {LEC: LECTURES,
+                          ASG: "<p>Sep. 09, 2026 A1 Due %s</p>" % due}),
+                     log=io.StringIO())
+            return buf.getvalue()
+
+        with TempDir() as d:
+            run("Sep. 13")
+            report = run("Sep. 20", ["--diff"])
+        self.assertIn("DATE CHANGED", report)
+        self.assertNotIn("DISAPPEARED", report)
+
+    def test_a_retitled_lecture_is_an_update_not_a_replacement(self):
+        # The mirror-image core path, guarded the same way end to end.
         with TempDir() as d:
             self._run(d, "<p>Dec. 07, 2026 Sampling Based Algorithms</p>")
             report = self._run(
-                d, "<p>Dec. 09, 2026 Sampling Based Algorithms</p>", ["--diff"])
-        self.assertIn("DATE CHANGED", report)
+                d, "<p>Dec. 07, 2026 Sampling Based Algorithms II</p>",
+                ["--diff"])
+        self.assertIn("DETAILS CHANGED", report)
         self.assertNotIn("DISAPPEARED", report)
+        self.assertNotIn("NEW (", report)
 
 
 class TestDropReporting(unittest.TestCase):

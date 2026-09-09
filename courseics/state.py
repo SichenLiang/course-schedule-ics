@@ -299,12 +299,18 @@ def diff(old: List[Record], new: List[Record]) -> Dict[str, List]:
         o, n = old_by_uid[uid], new_by_uid[uid]
         if o.date != n.date or o.time != n.time:
             moved.append((o, n))
-        elif o.confidence != n.confidence:
-            # Only the confidence can change under a stable UID. The title is
-            # hashed into the UID, so a retitled row necessarily arrives as a
-            # different UID and is reported as removed + added -- see
-            # DESIGN.md "Known limitations". format_diff used to carry a
-            # "title X -> Y" branch that no input could ever reach.
+        if o.title != n.title or o.confidence != n.confidence:
+            # A title CAN change under a stable UID now that a lecture is
+            # keyed by its date (parse.DATE_KEYED_KINDS): the recorded course
+            # retitled one slot twice in a day, and that has to read as an
+            # edit to one event rather than a deletion plus an arrival.
+            #
+            # Not an `elif`. A lecture's UID carries its date but not its
+            # clock time, so a slot that is retitled AND moved to a different
+            # hour is a real input that belongs in both lists; saying only
+            # half of it would be the same silence this section exists to
+            # break. A title-keyed row cannot reach both (its title is in the
+            # UID), and neither can a lecture that changed date.
             changed.append((o, n))
 
     added.sort(key=lambda r: (r.date, r.title))
@@ -344,8 +350,15 @@ def format_diff(d: Dict[str, List], old_count: int, new_count: int) -> str:
         out.append("")
         out.append("DETAILS CHANGED (%d):" % len(d["changed"]))
         for o, n in d["changed"]:
-            out.append("  ~ %s  %s  confidence %s -> %s"
-                       % (_stamp(n), n.title, o.confidence, n.confidence))
+            out.append("  ~ %s  %s" % (_stamp(n), n.title))
+            if o.title != n.title:
+                # The old title has to be printed, not merely implied: the
+                # whole point of keeping the UID through a retitle is that the
+                # reader can see it was the SAME event that was renamed.
+                out.append("      title %r  ->  %r" % (o.title, n.title))
+            if o.confidence != n.confidence:
+                out.append("      confidence %s -> %s"
+                           % (o.confidence, n.confidence))
     if d["removed"]:
         out.append("")
         out.append("DISAPPEARED (%d):" % len(d["removed"]))

@@ -16,7 +16,7 @@ __all__ = [
     "CERTAIN", "UNCERTAIN",
     "KIND_LECTURE", "KIND_ASSIGNMENT_OUT", "KIND_ASSIGNMENT_DUE",
     "KIND_UNKNOWN", "Record", "Dropped", "parse_line", "parse_page",
-    "assign_uids", "dedupe",
+    "assign_uids", "dedupe", "DATE_KEYED_KINDS",
 ]
 
 # Every legal spelling of a month, longest first. The regex alternation is
@@ -95,9 +95,10 @@ COURSE_CODE_RE = re.compile(r"[A-Z]{2,4}[-\s]?UY[-\s]?\d{4}", re.IGNORECASE)
 #
 #   STRIPPING a cue off the end of a title: "is this trailing word part of the
 #   name of the item, or is it pointing at the next date on the line?" Being
-#   wrong here silently truncates a title -- and the title is hashed into the
-#   UID, so a truncation also rotates the UID and the calendar deletes the
-#   event and creates a new one. So the vocabulary must be NARROW.
+#   wrong here silently truncates a title. For every kind whose identity rests
+#   on its title -- assignments and `unknown`, see DATE_KEYED_KINDS -- a
+#   truncation also rotates the UID, so the calendar deletes the event and
+#   creates a new one. So the vocabulary must be NARROW.
 #
 # Sharing one regex made the second question inherit the first one's width,
 # and the widened list ate real titles:
@@ -159,6 +160,26 @@ NOISE_LINES = {
 }
 
 
+# Which half of (date, title) an event's identity rests on, per kind.
+#
+# The two kinds of row on a course page are stable in OPPOSITE halves, and one
+# rule for both necessarily got one of them wrong:
+#
+#   A lecture is a slot. "the 9 Sep lecture" is the thing; the title is the
+#   instructor's current summary of what that slot will cover. On 2026-09-09
+#   the recorded course's page retitled one slot twice within a single day and
+#   moved part of its subject matter to the next session. Keyed on the title,
+#   each of those edits deleted the event and built a new one.
+#
+#   An assignment is an artefact. "Assignment 2" is the thing; its date is a
+#   deadline, and a deadline moving is the most common edit a course page ever
+#   makes -- the edit this program exists to survive as an update.
+#
+# `unknown` carries no page convention behind it, so it keeps the conservative
+# title key rather than inheriting a guess about which half is stable.
+DATE_KEYED_KINDS = frozenset([KIND_LECTURE])
+
+
 @dataclass
 class Record:
     date: str                     # ISO YYYY-MM-DD
@@ -172,7 +193,19 @@ class Record:
     uid: str = ""
 
     def identity(self) -> Tuple[str, str, str]:
-        return (self.source_url, self.title, self.kind)
+        """(source, the stable half, kind) -- the key the UID is hashed from.
+
+        The stable half is the date for a lecture and the title for everything
+        else; see DATE_KEYED_KINDS. The tuple order is (url, half, kind) in
+        both cases, which is what keeps the title-keyed kinds hashing to
+        exactly the digests they hashed to before lectures were split off.
+        """
+        stable = self.date if self.kind in DATE_KEYED_KINDS else self.title
+        return (self.source_url, stable, self.kind)
+
+    def discriminator(self) -> str:
+        """The other half. Folded in only when `identity()` is ambiguous."""
+        return self.title if self.kind in DATE_KEYED_KINDS else self.date
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -395,7 +428,8 @@ def parse_line(line: str, source_url: str, default_kind: str,
         seg = stripped[hit.match.end():seg_end]
         # A trailing due-cue introduces the NEXT date; it is not this title.
         # Stripped with the NARROW vocabulary -- see TRAILING_CUE_RE. Getting
-        # this wrong truncates a title, and the title is in the UID.
+        # this wrong truncates a title, and for a title-keyed kind the title
+        # is in the UID.
         segments.append(TRAILING_CUE_RE.sub("", seg))
 
     for idx, hit in enumerate(hits):
@@ -500,28 +534,40 @@ def parse_line(line: str, source_url: str, default_kind: str,
 
 
 def assign_uids(records: List[Record]) -> None:
-    """Stable, reproducible UIDs.
+    """Stable, reproducible UIDs, keyed on whichever half the kind holds still.
 
-    The date is excluded whenever (url, title, kind) identifies exactly one
-    row, which is the overwhelmingly common case: a lecture that moves keeps
-    its UID, so the calendar UPDATES the event instead of deleting it and
+    One rule, applied twice with the halves swapped (see DATE_KEYED_KINDS):
+
+        hash(url, stable half, kind)                  when that identifies
+                                                      exactly one row
+        hash(url, stable half, kind, other half)      when it does not
+        ... plus a "#N" tiebreaker                    if even that repeats
+
+    For an assignment the stable half is the title, so a deadline that moves
+    keeps its UID: the calendar UPDATES the event instead of deleting it and
     creating a second one, and --diff reports "moved" rather than
-    "removed + added".
+    "removed + added". That is the guarantee the whole program is built on.
 
-    When the key does NOT identify one row the date goes in. ROB-UY 3303 has
-    two rows called "Project working session", on Dec 07 and Dec 09. Numbering
-    them by sorted position was fake stability: delete the Dec 07 row and the
-    Dec 09 row inherits its UID, so --diff invents a reschedule that never
-    happened, reports the vanished item under the wrong date, and any local
-    edit the student made to the Dec 09 event is silently reassigned. For rows
-    that are otherwise indistinguishable the date IS the identity, so it
-    belongs in the hash.
+    For a lecture the stable half is the date, for the mirror-image reason: a
+    slot's date is what the student's own notes and alarms are attached to,
+    while its title is a summary the instructor rewrites in place. Keying
+    lectures on the title made a retitle a delete + rebuild -- observed twice
+    in one day on the real page, with content shuffled between two adjacent
+    sessions, which is precisely the case a title key cannot tell apart from
+    "one item vanished and another appeared".
 
-    The cost is that a same-titled row which moves reads as delete + add. That
-    is the price of not being able to tell two identical rows apart at all --
-    and deletion, the more common and more harmful case, becomes correct.
-    A "#N" tiebreaker still guarantees uniqueness if two such rows also share
-    a date.
+    Folding in the other half is the same rule the duplicate-row fix
+    introduced, generalised. ROB-UY 3303 has two rows called "Project working
+    session", on Dec 07 and Dec 09; numbering duplicates by sorted position was
+    fake stability, because deleting the Dec 07 row let the Dec 09 row inherit
+    its UID. Two rows that a key cannot tell apart are told apart by the half
+    the key left out. Under a date key that pair needs no fallback at all --
+    their dates already differ -- and the fallback instead catches two lectures
+    scheduled on the same day.
+
+    The cost is symmetrical and accepted: an ambiguous row that moves reads as
+    delete + add, and a lecture whose DATE changes reads the same way. See
+    DESIGN.md §7.
     """
     ambiguous = {}  # type: Dict[Tuple[str, str, str], int]
     for rec in records:
@@ -531,9 +577,9 @@ def assign_uids(records: List[Record]) -> None:
     seen = {}  # type: Dict[Tuple, int]
     for rec in records:
         key = rec.identity()
-        parts = [rec.source_url, rec.title, rec.kind]
+        parts = list(key)
         if ambiguous[key] > 1:
-            parts.append(rec.date)
+            parts.append(rec.discriminator())
         dedupe_key = tuple(parts)
         n = seen.get(dedupe_key, 0)
         seen[dedupe_key] = n + 1

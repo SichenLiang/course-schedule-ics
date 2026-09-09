@@ -1,12 +1,16 @@
 """ICS shape, escaping, folding, UID stability, alarms."""
 
+import contextlib
 import datetime as dt
+import hashlib
 import unittest
 
+from courseics import parse as parse_mod
 from courseics.config import Config
 from courseics.ics import build_calendar, escape, fold, uri_value
 from courseics.parse import (CERTAIN, KIND_ASSIGNMENT_DUE, KIND_ASSIGNMENT_OUT,
-                           KIND_LECTURE, UNCERTAIN, Record, assign_uids)
+                           KIND_LECTURE, KIND_UNKNOWN, UNCERTAIN, Record,
+                           assign_uids)
 
 URL = "https://example.invalid/lectures"
 NOW = dt.datetime(2026, 9, 2, 12, 0, 0, tzinfo=dt.timezone.utc)
@@ -276,9 +280,83 @@ class TestAlarms(unittest.TestCase):
 
 
 class TestUidStability(unittest.TestCase):
-    def test_uid_ignores_the_date(self):
-        a = [rec(date="2026-09-02")]
-        b = [rec(date="2026-10-20")]
+    """The two invariants, each stated on the kind it is about.
+
+    An assignment is identified by its title and a lecture by its date, so
+    neither invariant can be written without naming a kind -- `rec()` defaults
+    to a lecture, and the guarantee for a lecture is the mirror image of the
+    guarantee for a deadline. See parse.DATE_KEYED_KINDS.
+    """
+
+    def test_an_assignment_that_moves_keeps_its_uid(self):
+        # INVARIANT 1, the old one: a rescheduled deadline is an update to the
+        # existing event, never a deletion plus an arrival.
+        a = [rec(date="2026-09-13", title="Assignment 1",
+                 kind=KIND_ASSIGNMENT_DUE)]
+        b = [rec(date="2026-09-20", title="Assignment 1",
+                 kind=KIND_ASSIGNMENT_DUE)]
+        assign_uids(a)
+        assign_uids(b)
+        self.assertEqual(a[0].uid, b[0].uid)
+
+    def test_a_released_assignment_that_moves_keeps_its_uid(self):
+        # The same invariant on the other title-keyed assignment kind.
+        a = [rec(date="2026-09-09", title="Assignment 1",
+                 kind=KIND_ASSIGNMENT_OUT)]
+        b = [rec(date="2026-09-10", title="Assignment 1",
+                 kind=KIND_ASSIGNMENT_OUT)]
+        assign_uids(a)
+        assign_uids(b)
+        self.assertEqual(a[0].uid, b[0].uid)
+
+    def test_a_lecture_that_is_retitled_keeps_its_uid(self):
+        # INVARIANT 2, the new one, in the exact shape the real page produced
+        # on 2026-09-09: the same slot, its title rewritten in place.
+        a = [rec(date="2026-09-02",
+                 title="Introduction, History, and Architectures")]
+        b = [rec(date="2026-09-02", title="Introduction, and History")]
+        assign_uids(a)
+        assign_uids(b)
+        self.assertEqual(a[0].uid, b[0].uid)
+
+    def test_a_lecture_that_changes_date_does_not_keep_its_uid(self):
+        # The accepted cost of invariant 2, asserted so it stays a decision
+        # rather than a surprise. See DESIGN.md section 14.
+        a = [rec(date="2026-09-09", title="Architectures")]
+        b = [rec(date="2026-09-11", title="Architectures")]
+        assign_uids(a)
+        assign_uids(b)
+        self.assertNotEqual(a[0].uid, b[0].uid)
+
+    def test_a_title_keyed_uid_is_the_digest_it_always_was(self):
+        # Pins the migration claim in README/DESIGN: the scheme changed for
+        # lectures only, so an existing subscriber's assignment events keep the
+        # UIDs they already have. This is the formula DESIGN.md section 7 gave
+        # before lectures were split off, spelled out rather than assumed.
+        r = rec(date="2026-09-13", title="Assignment 1",
+                kind=KIND_ASSIGNMENT_DUE)
+        assign_uids([r])
+        raw = "\x00".join([URL, "Assignment 1", KIND_ASSIGNMENT_DUE])
+        self.assertEqual(
+            r.uid,
+            hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+            + "@course-schedule-ics")
+
+    def test_a_date_keyed_uid_swaps_the_two_halves_and_nothing_else(self):
+        r = rec(date="2026-09-13", title="Intro", kind=KIND_LECTURE)
+        assign_uids([r])
+        raw = "\x00".join([URL, "2026-09-13", KIND_LECTURE])
+        self.assertEqual(
+            r.uid,
+            hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+            + "@course-schedule-ics")
+
+    def test_unknown_keeps_the_conservative_title_key(self):
+        # `unknown` exists because the page stated no convention, so there is
+        # nothing to justify assuming its dates are the stable half. It is not
+        # in DATE_KEYED_KINDS, and this says so out loud.
+        a = [rec(date="2026-09-13", title="Something", kind=KIND_UNKNOWN)]
+        b = [rec(date="2026-09-20", title="Something", kind=KIND_UNKNOWN)]
         assign_uids(a)
         assign_uids(b)
         self.assertEqual(a[0].uid, b[0].uid)
@@ -298,7 +376,21 @@ class TestUidStability(unittest.TestCase):
         self.assertNotEqual(rs[0].uid, rs[1].uid)
 
     def test_uid_differs_by_title(self):
+        # Two lectures on one date: the date alone no longer identifies a row,
+        # so the title is folded back in. Exercised in full by
+        # TestSameDayLectureCollision below.
         rs = [rec(title="One"), rec(title="Two")]
+        assign_uids(rs)
+        self.assertNotEqual(rs[0].uid, rs[1].uid)
+
+    def test_uids_of_different_kinds_do_not_collide_across_the_two_schemes(self):
+        # A lecture hashes (url, DATE, kind) and an assignment hashes
+        # (url, TITLE, kind) in the same tuple position, so a lecture on
+        # "2026-09-02" and an assignment titled "2026-09-02" occupy the same
+        # slot. `kind` is what keeps them apart, and it is in the hash.
+        rs = [rec(date="2026-09-02", title="Intro", kind=KIND_LECTURE),
+              rec(date="2026-09-02", title="2026-09-02",
+                  kind=KIND_ASSIGNMENT_DUE)]
         assign_uids(rs)
         self.assertNotEqual(rs[0].uid, rs[1].uid)
 
@@ -311,12 +403,18 @@ class TestUidStability(unittest.TestCase):
 
 
 class TestAmbiguousRowIdentity(unittest.TestCase):
-    """Two rows sharing (url, title, kind) are told apart by their date.
+    """Two rows a key cannot tell apart are told apart by the half it omits.
 
-    Numbering them by position was fake stability. Deleting the earlier row
+    The real pair is two `Project working session` lectures, Dec 07 and Dec 09.
+    Numbering them by position was fake stability: deleting the earlier row
     handed its UID to the later one, so the calendar moved the wrong event,
     --diff invented a reschedule, and the student's own edits on the surviving
     event were silently reassigned to a different session.
+
+    Under a date-keyed lecture the pair is no longer ambiguous at all -- their
+    dates differ, so nothing has to be folded in. These stay as regression
+    guards on the real page: the outcome the audit demanded must still hold,
+    whichever mechanism delivers it.
     """
 
     PAIR = ("2026-12-07", "2026-12-09")
@@ -366,24 +464,148 @@ class TestAmbiguousRowIdentity(unittest.TestCase):
         assign_uids(rs)
         self.assertEqual(len({r.uid for r in rs}), 2)
 
-    def test_a_unique_row_keeps_a_date_free_uid(self):
+    def test_a_unique_deadline_keeps_a_date_free_uid(self):
         # The hardened core path: an ordinary reschedule is still an update.
-        a = [rec(date="2026-12-07", title="Project working session")]
-        b = [rec(date="2026-12-14", title="Project working session")]
+        # Stated on a deadline, which is the kind whose identity is its title.
+        a = [rec(date="2026-12-07", title="Final report",
+                 kind=KIND_ASSIGNMENT_DUE)]
+        b = [rec(date="2026-12-14", title="Final report",
+                 kind=KIND_ASSIGNMENT_DUE)]
         assign_uids(a)
         assign_uids(b)
         self.assertEqual(a[0].uid, b[0].uid)
 
-    def test_a_new_duplicate_rotates_the_original_uid_once(self):
+    def test_a_new_duplicate_rotates_the_original_deadline_uid_once(self):
         # The accepted cost, asserted so it stays a decision and not a
-        # surprise: the first appearance of a second same-titled row moves the
-        # original off its date-free UID. It is stable from then on.
+        # surprise: the first appearance of a second same-titled deadline
+        # moves the original off its date-free UID. Stable from then on.
+        def pair():
+            rs = [rec(date=d, title="Final report", kind=KIND_ASSIGNMENT_DUE)
+                  for d in self.PAIR]
+            assign_uids(rs)
+            return rs
+
+        solo = [rec(date="2026-12-07", title="Final report",
+                    kind=KIND_ASSIGNMENT_DUE)]
+        assign_uids(solo)
+        first = pair()
+        self.assertNotEqual(solo[0].uid, first[0].uid)
+        self.assertEqual([r.uid for r in first], [r.uid for r in pair()])
+
+    def test_a_second_same_titled_lecture_rotates_nothing(self):
+        # What the date key buys on the real pair: the Dec 07 session's UID
+        # never depended on whether a second `Project working session` existed,
+        # so the day the second one appeared cost the first one nothing.
         solo = [rec(date="2026-12-07", title="Project working session")]
         assign_uids(solo)
-        pair = self._pair()
-        self.assertNotEqual(solo[0].uid, pair[0].uid)
-        again = self._pair()
-        self.assertEqual([r.uid for r in pair], [r.uid for r in again])
+        self.assertEqual(solo[0].uid, self._pair()[0].uid)
+
+
+class TestSameDayLectureCollision(unittest.TestCase):
+    """Two lectures on one date -- the case a date key has to survive.
+
+    The real page schedules a lecture and an assignment release on the same
+    day (2026-09-09), which the `kind` in the hash already separates. Two
+    LECTURES on one day is the case the date alone cannot separate, so the
+    title -- the half the lecture key leaves out -- is folded back in. It is
+    the same fallback the duplicate-`Project working session` fix introduced,
+    with the two halves swapped, and not a second competing rule.
+    """
+
+    DAY = "2026-09-09"
+
+    def _both(self):
+        rs = [rec(date=self.DAY, title="Lecture"),
+              rec(date=self.DAY, title="Lab section")]
+        assign_uids(rs)
+        return rs
+
+    def test_two_lectures_on_one_day_get_distinct_uids(self):
+        rs = self._both()
+        self.assertEqual(len({r.uid for r in rs}), 2)
+
+    def test_the_pair_is_order_independent(self):
+        forward = self._both()
+        rs = [rec(date=self.DAY, title="Lab section"),
+              rec(date=self.DAY, title="Lecture")]
+        assign_uids(rs)
+        # Reordering the page must not move identity between the two rows.
+        self.assertEqual(rs[1].uid, forward[0].uid)
+        self.assertEqual(rs[0].uid, forward[1].uid)
+
+    def test_deleting_one_does_not_hand_its_uid_to_the_other(self):
+        # The identity-theft bug, in the shape the new key can produce it.
+        before = self._both()
+        after = [rec(date=self.DAY, title="Lab section")]
+        assign_uids(after)
+        self.assertNotEqual(after[0].uid, before[0].uid)
+
+    def test_two_lectures_identical_in_both_halves_still_differ(self):
+        # Nothing distinguishes these but their position, so the "#N"
+        # tiebreaker is all that is left. Uniqueness is the only promise.
+        rs = [rec(date=self.DAY, title="Lecture", time="10:00"),
+              rec(date=self.DAY, title="Lecture", time="14:00")]
+        assign_uids(rs)
+        self.assertEqual(len({r.uid for r in rs}), 2)
+
+    def test_a_same_day_lecture_loses_the_retitle_guarantee(self):
+        # The honest cost of the fallback: once a day holds two lectures, the
+        # title is back in their identity, so retitling one of them is a
+        # delete plus an add again. Asserted rather than left to be discovered.
+        before = self._both()
+        after = [rec(date=self.DAY, title="Lecture (revised)"),
+                 rec(date=self.DAY, title="Lab section")]
+        assign_uids(after)
+        self.assertNotEqual(after[0].uid, before[0].uid)
+
+
+@contextlib.contextmanager
+def date_keyed(kinds):
+    """Temporarily rebind which kinds hash their date instead of their title."""
+    original = parse_mod.DATE_KEYED_KINDS
+    parse_mod.DATE_KEYED_KINDS = frozenset(kinds)
+    try:
+        yield
+    finally:
+        parse_mod.DATE_KEYED_KINDS = original
+
+
+class TestTheIdentityRuleIsLoadBearing(unittest.TestCase):
+    """Mutation guards: undo the rule and the invariant above must go red.
+
+    A regression test that still passes when the code it guards is reverted is
+    guarding nothing. Each invariant is paired here with the smallest edit that
+    undoes it -- changing which kinds are date-keyed -- and the pair asserts
+    that the invariant does NOT hold under that edit. If either of these ever
+    passes silently, the matching test in TestUidStability has stopped
+    depending on the rule it claims to test.
+    """
+
+    def test_reverting_lectures_to_a_title_key_breaks_the_retitle_invariant(self):
+        a = [rec(date="2026-09-02",
+                 title="Introduction, History, and Architectures")]
+        b = [rec(date="2026-09-02", title="Introduction, and History")]
+        with date_keyed([]):            # the pre-change rule: title for all
+            assign_uids(a)
+            assign_uids(b)
+        self.assertNotEqual(a[0].uid, b[0].uid)
+
+    def test_moving_assignments_to_a_date_key_breaks_the_reschedule_invariant(self):
+        a = [rec(date="2026-09-13", title="Assignment 1",
+                 kind=KIND_ASSIGNMENT_DUE)]
+        b = [rec(date="2026-09-20", title="Assignment 1",
+                 kind=KIND_ASSIGNMENT_DUE)]
+        with date_keyed([KIND_LECTURE, KIND_ASSIGNMENT_DUE,
+                         KIND_ASSIGNMENT_OUT]):
+            assign_uids(a)
+            assign_uids(b)
+        self.assertNotEqual(a[0].uid, b[0].uid)
+
+    def test_the_rebinding_is_undone(self):
+        # The two guards above mutate module state; if the restore ever broke,
+        # every later test would be running against the wrong rule.
+        self.assertEqual(parse_mod.DATE_KEYED_KINDS,
+                         frozenset([KIND_LECTURE]))
 
 
 if __name__ == "__main__":

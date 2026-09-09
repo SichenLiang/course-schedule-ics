@@ -303,71 +303,130 @@ weekday is as likely to be the stale half as the date is.
 
 ---
 
-## 7. UIDs based on source + title + kind — never the date
+## 7. Event identity: each kind keyed on the half that holds still
 
 ```
-unique key:    uid = sha256("<url>\0<title>\0<kind>")[:32] + "@course-schedule-ics"
-ambiguous key: uid = sha256("<url>\0<title>\0<kind>\0<date>")[:32] + "@course-schedule-ics"
+lecture           uid = sha256("<url>\0<date>\0<kind>")[:32]  + "@course-schedule-ics"
+everything else   uid = sha256("<url>\0<title>\0<kind>")[:32] + "@course-schedule-ics"
+ambiguous         ... with the other half appended, then a "\0#N" tiebreaker
 ```
 
-**Why the date is excluded.** A UID is a calendar's identity for an event. If
-the date were in the hash, moving a lecture would produce a *different* UID,
-and the calendar would delete the old event and create a new one. The user
-loses anything attached to the original — their own notes, a snoozed alarm,
-their RSVP — and the `--diff` report would show "1 removed, 1 added" instead of
-the fact that actually matters: **this lecture moved**. With the date excluded,
-a moved date is an *update* to a stable event, which is what the calendar
-protocol is for.
+One rule, applied with the two halves swapped:
 
-**Why the date comes back when the key is ambiguous.** Two rows can legitimately
-share `(url, title, kind)`: the recorded course really does have two `Project
-working session` lectures, on Dec 07 and Dec 09. The original scheme numbered the
-duplicates `#0`, `#1` … by sorted position, so the first took no suffix and the
-second took `#1`.
+> Hash the source, the kind, and **the half of `(date, title)` that this kind
+> holds still**. If that does not identify exactly one row, append the other
+> half. If even that repeats, append `#N`.
 
-An audit broke it, and the break was severe. Delete the Dec 07 row — the far
-likelier edit — and the Dec 09 row slides into position 0 and **inherits the
-deleted row's UID**. Every consequence is wrong:
+A UID is a calendar's identity for an event. Under a stable UID an edit is an
+*update*: the subscriber's own notes, snoozes and RSVPs survive, and `--diff`
+says what changed instead of "1 removed, 1 added". Under a rotated UID the
+calendar deletes the event and creates a different one, and everything attached
+to it is gone. So the only question worth asking about identity is: **which
+field does this kind of row keep still while the other one moves?**
 
-- the calendar *moves* the Dec 07 event to Dec 09 instead of deleting it;
-- `--diff` reports a reschedule that never happened;
-- the disappearance is reported under the wrong date (`Dec 09`, not `Dec 07`);
-- whatever the student attached to the real Dec 09 event — a reminder, a note,
-  a snooze — is silently transferred to a session that no longer exists.
+The two kinds of row on a course page answer it in opposite directions.
 
-Position was fake stability. For rows that are otherwise indistinguishable, the
-**date is the identity**, so it goes in the hash. When the key identifies
-exactly one row — the overwhelmingly common case, and the one the paragraph
-above is about — nothing changes and a reschedule is still an in-place update.
+**An assignment is an artefact; its title holds still.** `Assignment 2` is the
+thing. Its date is a deadline, and a deadline moving is the most common edit a
+course page ever makes. Keying on the title means a reschedule updates the
+event, which is the guarantee this program exists to provide.
 
-**The accepted cost.** A same-titled row that moves now reads as delete + add,
-and the first appearance of a second same-titled row rotates the original's UID
-once. Both are one-off, both are visible in `--diff`, and neither invents a
-fact. Deletion — more common, and actively deceptive under the old scheme — is
-correct. A `#N` tiebreaker still guarantees uniqueness if two ambiguous rows
-also share a date.
+**A lecture is a slot; its date holds still.** "The 9 Sep lecture" is the thing.
+Its title is the instructor's current summary of what that slot will cover, and
+a summary is *drafting*, not identity. Keying it on its title was wrong, and the
+recorded course demonstrated how wrong on **2026-09-09**, within a single day:
 
-**Rejected: a stable page anchor such as `Week 15` in the hash.** The obvious
-better answer, and it does not exist on this page: `Week 15` is its own text
-line and *both* `Project working session` rows sit under it. It would not
-disambiguate the only pair it was meant to disambiguate.
+| time | Sep 02 slot | Sep 09 slot |
+|---|---|---|
+| before | `Introduction, History, and Architectures` | `Coordinate Frames, Kinematics, Probability` |
+| 01:00 | `Introduction, History, and` | gains `Architectures` |
+| 13:00 | `Introduction, and History` | `Architectures, Representations, Assignment Teams & Forms` |
 
-**Rejected: remembering in `state.json` which keys were once ambiguous**, so
-that the survivor of a deletion keeps its date-qualified UID. It removes the
-last rotation, at the price of making a UID depend on run history: a fresh
+The pipeline caught both edits and published both times. Under a title key each
+publish rotated two UIDs, so a calendar people subscribe to deleted and rebuilt
+two events twice in one day. Two consequences, and the second is the serious
+one:
+
+- a deleted-and-recreated event drops whatever the student attached to the old
+  one, and nothing in the format stops a subscriber's client from **re-firing
+  an alarm that already fired** — not measured here, and not something this
+  program can prevent once it has rotated the UID;
+- when the title and the date move at the same time, a title-keyed tool
+  **cannot tell "this item was rewritten" from "one item vanished and an
+  unrelated one appeared"** — which is the exact confusion this program is
+  built to prevent. The subject matter really did slide from the Sep 02 slot
+  into the Sep 09 slot; nothing in a title comparison can see that.
+
+`unknown` keeps the title key. It is the kind that exists precisely because the
+page stated no convention, so there is nothing to justify assuming its dates are
+the stable half; the conservative default is to leave it where it was.
+
+**Why the fallback is the same rule, not a second one.** Two rows a key cannot
+tell apart are told apart by the half the key omitted. That mechanism already
+existed — the recorded course has two `Project working session` lectures, on
+Dec 07 and Dec 09, and numbering duplicates `#0`, `#1` … by sorted position was
+fake stability: delete the Dec 07 row and the Dec 09 row slid into position 0
+and **inherited the deleted row's UID**. The calendar moved the Dec 07 event
+instead of deleting it, `--diff` reported a reschedule that never happened under
+the wrong date, and the student's own edits on the real Dec 09 session were
+silently reassigned to one that no longer existed.
+
+Generalising the rule keeps it a single rule with the halves swapped per kind,
+rather than two mechanisms that can disagree. What changes is *which* case it
+catches:
+
+| case | before | now |
+|---|---|---|
+| two `Project working session` lectures, different dates | ambiguous; date folded in | **not ambiguous**; their dates already differ |
+| two lectures on the *same* date | not ambiguous | ambiguous; **title folded in** |
+| two same-titled assignments, different dates | ambiguous; date folded in | unchanged |
+
+The real page has a lecture and an assignment release on the same day
+(2026-09-09); `kind` is in the hash, so those never collided and still do not.
+Two *lectures* on one day is the genuine collision, and the fallback resolves it
+to exactly the old behaviour for that pair — identity by title — which also
+means those two rows, and only those two, do not get the retitle guarantee. The
+cost is stated in §14 and asserted in `TestSameDayLectureCollision`.
+
+**Why not disambiguate same-day lectures by position or by time?** Position is
+the fake stability the audit already rejected: deleting the day's first lecture
+would hand its UID to the second. Time is absent — every lecture row on the real
+page is all-day — so it would resolve nothing on the only page we have, while
+adding a field whose absence has to be special-cased anyway.
+
+**Rejected: a stable page anchor such as `Week 15` in the hash.** It does not
+exist usefully: `Week 15` is its own text line and *both* `Project working
+session` rows sit under it.
+
+**Rejected: remembering in `state.json` which keys were once ambiguous.** It
+removes one rotation at the price of making a UID depend on run history: a fresh
 clone would emit different UIDs from an incremental run for the same page.
-Reproducibility is worth more than one avoided rotation.
+Reproducibility is worth more.
 
-**Rejected: a random UUID per event.** Not reproducible. Every run would
-republish the entire calendar as new events.
+**Rejected: a random UUID per event.** Not reproducible; every run would
+republish the whole calendar.
 
-**Rejected: hashing the raw source line.** A typo fix on the page would rotate
-the UID and duplicate the event.
+**Rejected: hashing the raw source line.** A typo fix would rotate the UID.
+
+**Rejected: making the choice configurable per source.** The stable half is a
+property of what the row *is*, not of the page it came from, and a user who set
+it wrongly would get the 2026-09-09 damage back with no way to see why. If a
+page ever appears whose lectures are genuinely title-identified, that is the
+moment to add the knob, not before.
+
+**Migration cost, once.** The tuple order is `(url, half, kind)` in both
+schemes, so the kinds whose stable half is the title hash *exactly* what they
+hashed before: on the recorded course all 12 assignment events keep their
+existing UIDs, and only the 30 lecture events rotate. Verified against the
+pre-change implementation on the real pages, and the formula is pinned by
+`test_a_title_keyed_uid_is_the_digest_it_always_was`. Existing subscribers
+still see their lecture events replaced once, on the first run after this
+change; nothing they attached to a lecture survives it. It is a one-off. No
+promise is made that it is the last one — §8's rename was also a one-off — only
+that this scheme has no further rotation scheduled in it.
 
 **Known consequence.** `kind` is in the hash, so §8's rename rotated the UID of
-the six release-date events exactly once. They appear as six removals plus six
-additions in that one run, and are stable from then on. This was accepted as a
-one-off cost, taken now while the calendar has no subscribers.
+the six release-date events exactly once, before this change.
 
 ---
 
@@ -412,10 +471,11 @@ vocabulary is deliberately wide — a page that renames its "Due" column to
 "Submission" has not stopped having deadlines.
 
 *Deleting* asks: is this trailing word the name of the item, or a pointer at
-the next date on the line? Getting it wrong truncates a real title — and the
-title is hashed into the UID, so a truncation also **rotates the UID**, and the
-calendar deletes the event and creates a new one in its place. That is a silent
-loss with a knock-on effect; the recognition error is a visible one.
+the next date on the line? Getting it wrong truncates a real title — and for a
+title-keyed kind (§7), which is every kind a due cue can appear on, the title is
+hashed into the UID, so a truncation also **rotates the UID**, and the calendar
+deletes the event and creates a new one in its place. That is a silent loss with
+a knock-on effect; the recognition error is a visible one.
 
 The two lists were shared, so widening the first widened the second, and real
 titles disappeared into it:
@@ -737,26 +797,54 @@ Found by audit, deliberately not fixed. Each is a real defect; each is here
 because the fix costs more than the defect, or because the fix is a product
 decision rather than a bug fix.
 
-### A retitled row is a delete plus an add
+### A lecture that changes date is a delete plus an add
 
-The title is hashed into the UID, so correcting a typo on the page —
-`Sampling Based Algorithims` → `Sampling Based Algorithms` — rotates the UID.
-The calendar removes the event and creates a new one, and anything the student
-attached to the old one is lost.
+A lecture is identified by its date (§7), so moving the Sep 09 session to
+Sep 11 removes one event and creates another. Anything the student attached to
+the original — a note, a snooze, a colour — is lost, and `--diff` reports
+`DISAPPEARED` plus `NEW` rather than `DATE CHANGED`.
 
-Not fixed because it is a genuine design tension, not an oversight. The
-alternatives all trade one loss for another: hashing the row's position brings
-back exactly the identity-theft bug of §7; hashing only the date makes a
-reschedule a delete-plus-add instead, which is the *more* common edit; fuzzy
-title matching guesses, and guessing is what this parser is built not to do.
-Which loss is preferable depends on how the calendar is actually used, and that
-is a decision to take deliberately with the person using it, not to slip in
-under a bug fix.
+**Judgement: acceptable, and it is the right side of the trade.** Three
+reasons, in order of weight.
 
-**Consequence worth stating plainly:** because a shared UID implies a shared
-title, `format_diff` can only ever report a confidence change under
-`DETAILS CHANGED`. It used to carry a `title X -> Y` branch that no input could
-reach; that dead code has been removed rather than left to imply otherwise.
+1. *It is honest about what actually happened.* When a course moves a lecture
+   it does not usually move a slot; it cancels one meeting and holds a
+   different one, and the reader has to look at both days. "The 9 Sep lecture
+   is now the 11 Sep lecture" is a claim about continuity that the page does
+   not make and that the parser cannot check. Reporting a delete plus an add
+   asserts less, and asserting less is this program's whole posture.
+2. *A retitle is the edit that has actually been observed, and a moved lecture
+   is visible anyway.* On this page, retitles happened twice in one day; no
+   lecture has yet been observed changing its date. That is one page over one
+   term, not a law — but it is the only evidence there is, and it points one
+   way. A moved lecture also stays visible: it appears in `--diff` under two
+   headings on the run it happens, once. A retitle under the old scheme was
+   churn that could recur any number of times, each recurrence discarding
+   whatever the student had attached to the event.
+3. *The dangerous failure mode is gone either way.* The case that actually
+   deceives a reader is title-and-date changing together, and no key can follow
+   that. Under a date key it degrades to delete-plus-add, which is what it
+   looks like. Under a title key it degraded to a *plausible-looking rename*,
+   which is worse: it invites a false inference.
+
+Not fixed, then, because there is no fix — only a choice of which edit loses,
+and this is the one whose loss is smallest, rarest and most visible.
+
+### Two lectures on one day lose the retitle guarantee
+
+When a date holds two lectures, the title comes back into their identity (§7),
+so retitling one of them is a delete plus an add for that row. The recorded
+course has no such day; the case is covered by
+`TestSameDayLectureCollision`. There is no third field to fall back on that is
+not either position (rejected in §7 as fake stability) or absent (time).
+
+### A retitled assignment is a delete plus an add
+
+The mirror image, and unchanged by this work. An assignment is identified by
+its title, so correcting a typo on the page — `Assignment 3 - Trajectory
+Followng` → `Following` — rotates the UID. Not fixed for the reason above: the
+alternative is to key an assignment by its deadline, which would make the
+single most common edit on any course page a delete plus an add.
 
 ### An item on both pages produces two events
 

@@ -320,8 +320,12 @@ class TestDiff(unittest.TestCase):
         self.assertIn("NEW (1)", state_mod.format_diff(d, 1, 2))
 
     def test_date_moved_is_not_reported_as_add_plus_remove(self):
-        old = uidify([rec("2026-09-02", "Intro")])
-        new = uidify([rec("2026-10-20", "Intro")])
+        # A deadline, not a lecture: an assignment is the kind whose identity
+        # is its title, so it is the kind for which a date change is an edit.
+        # A lecture keyed by its date reads a date change as a replacement --
+        # see test_a_moved_lecture_is_a_replacement below.
+        old = uidify([rec("2026-09-02", "A1", "assignment_due")])
+        new = uidify([rec("2026-10-20", "A1", "assignment_due")])
         d = state_mod.diff(old, new)
         self.assertEqual(len(d["added"]), 0)
         self.assertEqual(len(d["removed"]), 0)
@@ -330,6 +334,47 @@ class TestDiff(unittest.TestCase):
         self.assertIn("DATE CHANGED", report)
         self.assertIn("was 2026-09-02", report)
         self.assertIn("now 2026-10-20", report)
+
+    def test_a_retitled_lecture_is_an_edit_not_a_replacement(self):
+        # 2026-09-09, from the real page: one slot, retitled in place. The
+        # report has to name the old title, because the whole value of keeping
+        # the UID is that the reader can see it was the same event.
+        old = uidify([rec("2026-09-02",
+                          "Introduction, History, and Architectures")])
+        new = uidify([rec("2026-09-02", "Introduction, and History")])
+        d = state_mod.diff(old, new)
+        self.assertEqual([len(v) for v in
+                          (d["added"], d["removed"], d["moved"], d["changed"])],
+                         [0, 0, 0, 1])
+        report = state_mod.format_diff(d, 1, 1)
+        self.assertIn("DETAILS CHANGED", report)
+        self.assertIn("Introduction, History, and Architectures", report)
+        self.assertIn("Introduction, and History", report)
+        self.assertNotIn("DISAPPEARED", report)
+        self.assertNotIn("NEW (", report)
+
+    def test_a_moved_lecture_is_a_replacement(self):
+        # The accepted cost of the date key, asserted rather than assumed: a
+        # lecture that changes day is a different slot. DESIGN.md section 14.
+        old = uidify([rec("2026-09-09", "Architectures")])
+        new = uidify([rec("2026-09-11", "Architectures")])
+        d = state_mod.diff(old, new)
+        self.assertEqual(len(d["moved"]), 0)
+        self.assertEqual(len(d["added"]), 1)
+        self.assertEqual(len(d["removed"]), 1)
+
+    def test_a_lecture_retitled_and_moved_to_another_hour_reports_both(self):
+        # A lecture's UID carries its date but not its clock time, so this is
+        # the one input that lands in `moved` AND `changed`. Reporting only
+        # half of it would hide a real edit.
+        old = uidify([rec("2026-09-02", "Intro", time="13:00")])
+        new = uidify([rec("2026-09-02", "Intro and History", time="14:00")])
+        d = state_mod.diff(old, new)
+        self.assertEqual(len(d["moved"]), 1)
+        self.assertEqual(len(d["changed"]), 1)
+        report = state_mod.format_diff(d, 1, 1)
+        self.assertIn("DATE CHANGED", report)
+        self.assertIn("DETAILS CHANGED", report)
 
     def test_removed(self):
         old = uidify([rec("2026-09-02", "Intro"), rec("2026-09-09", "Frames")])

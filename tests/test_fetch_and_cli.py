@@ -1466,18 +1466,35 @@ class TestRescheduledDeadlineKeepsItsUid(unittest.TestCase):
             code, after, report = self._replay(d, rotated, ["--diff"])
 
         self.assertEqual(code, EXIT_OK)
-        was = {r["uid"]: r for r in lectures}
-        now = {r["uid"]: r for r in after if r["source_url"] == LEC}
+        was = {r["date"]: r for r in lectures}
+        now = {r["date"]: r for r in after if r["source_url"] == LEC}
         self.assertEqual(set(was), set(now))
-        # 29 of the 30, because rotation hands the Dec 09 twin the Dec 07
+
+        # Rotation slides the two holiday titles onto their neighbours' dates,
+        # so four rows do not merely change their WORDING, they change what
+        # the day IS: two days stop being holidays and two start. The kind is
+        # in the UID on purpose -- a day that flips between "come to class"
+        # and "do not" is a different event, not an edited one -- so those
+        # four rotate, and they are named here rather than absorbed into a
+        # weaker assertion.
+        flipped = sorted(day for day in was
+                         if was[day]["kind"] != now[day]["kind"])
+        self.assertEqual(flipped, ["2026-09-07", "2026-09-09",
+                                   "2026-10-12", "2026-10-14"])
+
+        # The invariant itself: every row that was only retitled kept its UID.
+        retitled = 0
+        for day in was:
+            if day in flipped:
+                self.assertNotEqual(was[day]["uid"], now[day]["uid"], day)
+                continue
+            self.assertEqual(was[day]["uid"], now[day]["uid"], day)
+            if was[day]["title"] != now[day]["title"]:
+                retitled += 1
+        # 25 of the 26, because rotation hands the Dec 09 twin the Dec 07
         # twin's identical title.
-        retitled = [u for u in was if was[u]["title"] != now[u]["title"]]
-        self.assertEqual(len(retitled), 29)
-        for uid in retitled:
-            self.assertEqual(was[uid]["date"], now[uid]["date"])
-        self.assertIn("DETAILS CHANGED (29)", report)
-        self.assertNotIn("DISAPPEARED", report)
-        self.assertNotIn("NEW (", report)
+        self.assertEqual(retitled, 25)
+        self.assertIn("DETAILS CHANGED (25)", report)
 
     def test_shifting_every_lecture_by_a_day_rotates_every_lecture_uid(self):
         """The accepted cost of the date key, at page scale and stated plainly.
@@ -1810,7 +1827,11 @@ class TestEndToEndAgainstFixtures(unittest.TestCase):
         kinds = {}
         for r in recs:
             kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
-        self.assertEqual(kinds["lecture"], 30)
+        # 30 rows on the lecture page, two of which say the class does not
+        # meet. They are not lectures, and publishing them as `[?] lecture`
+        # was the bug this kind exists to fix.
+        self.assertEqual(kinds["lecture"], 28)
+        self.assertEqual(kinds["no_class"], 2)
         self.assertEqual(kinds["assignment_due"], 6)
         self.assertEqual(kinds["assignment_out"], 6)
         # Nothing is left semantically undecided: both assignment pages state
@@ -1819,6 +1840,81 @@ class TestEndToEndAgainstFixtures(unittest.TestCase):
         self.assertEqual(len({r["uid"] for r in recs}), 42)
         self.assertEqual(ics.count("BEGIN:VEVENT"), 42)
         self.assertIsNotNone(st["last_successful_run"])
+
+    def _events(self, ics):
+        """The .ics split into events, unfolded, one list of lines each."""
+        unfolded = ics.replace("\r\n ", "")
+        events, cur = [], None
+        for line in unfolded.split("\r\n"):
+            if line == "BEGIN:VEVENT":
+                cur = []
+            elif line == "END:VEVENT":
+                events.append(cur)
+                cur = None
+            elif cur is not None:
+                cur.append(line)
+        return events
+
+    def _run(self, d):
+        f = FixtureFetcher({LEC: "lectures.html", ASG: "assignments.html"},
+                           base_dir=FIXTURES)
+        main(["--out-dir", d], fetcher=f, log=io.StringIO())
+        return (read_json(os.path.join(d, "state.json"))["records"],
+                read_text(os.path.join(d, "schedule.ics")))
+
+    def test_only_the_deadlines_carry_a_reminder(self):
+        """The measurement this change was made for, on the real pages.
+
+        Before: 42 events, 42 VALARMs -- one reminder per event, of which 6
+        were deadlines. A student who goes to class by the timetable was
+        nudged 30 times a semester about lectures he was attending anyway.
+        After: the count of VALARMs equals the count of deadlines, and it is
+        asserted as an equality against the records rather than as the
+        literal 6, so it stays true when the page changes.
+        """
+        with TempDir() as d:
+            recs, ics = self._run(d)
+
+        due = [r for r in recs if r["kind"] == "assignment_due"]
+        self.assertEqual(len(due), 6)
+        self.assertEqual(ics.count("BEGIN:VALARM"), len(due))
+        self.assertEqual(ics.count("END:VALARM"), len(due))
+
+        # Not merely the right NUMBER of alarms: the right events.
+        for event in self._events(ics):
+            kind = [x for x in event if x.startswith("CATEGORIES:")][0]
+            alarms = sum(1 for x in event if x == "BEGIN:VALARM")
+            expected = 1 if kind == "CATEGORIES:assignment_due" else 0
+            self.assertEqual(alarms, expected, kind)
+
+    def test_the_two_holidays_are_stated_not_flagged(self):
+        """The other half of the same screenshot.
+
+        Both rows were published as `[?] ... - no class`, where `[?]` means
+        "this program could not work out what this row means". Both are
+        definite statements, and on the two days of the semester when being
+        wrong means turning up to a locked room.
+        """
+        with TempDir() as d:
+            recs, ics = self._run(d)
+
+        holidays = [r for r in recs if r["kind"] == "no_class"]
+        self.assertEqual(sorted(r["date"] for r in holidays),
+                         ["2026-09-07", "2026-10-12"])
+        for r in holidays:
+            self.assertEqual(r["confidence"], "certain", r["date"])
+
+        self.assertIn("SUMMARY:NO CLASS: Labor Day - no class", ics)
+        self.assertIn("SUMMARY:NO CLASS: Fall break - No class", ics)
+        # Nothing in the published calendar is flagged as doubtful any more,
+        # and these two rows were the only two that were.
+        self.assertNotIn("[?]", ics)
+
+        for event in self._events(ics):
+            if "CATEGORIES:no_class" not in event:
+                continue
+            self.assertNotIn("BEGIN:VALARM", event)
+            self.assertIn("confidence: certain", "\n".join(event))
 
     def test_run_is_deterministic_apart_from_timestamps(self):
         import re

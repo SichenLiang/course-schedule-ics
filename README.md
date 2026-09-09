@@ -1,6 +1,7 @@
 # course-schedule-ics
 
-Turns a public course web page into an `.ics` calendar with reminders.
+Turns a public course web page into an `.ics` calendar, with reminders on the
+deadlines and not on everything else.
 
 You point it at the pages your course posts its schedule on. It reads the
 dates, works out which are lectures and which are deadlines, and writes one
@@ -133,6 +134,13 @@ timezone = America/New_York
 default_due_time = 23:59
 alarm_days_before = 1
 
+[alarms]
+assignment_due = on
+assignment_out = off
+lecture = off
+no_class = off
+unknown = on
+
 [semester]
 fall_year = 2026
 
@@ -145,7 +153,7 @@ url = https://sites.google.com/example.edu/example-course/assignments
 kind = assignment_out
 ```
 
-Three settings decide more than they look like they do:
+Four settings decide more than they look like they do:
 
 **`fall_year` is required and has no default.** Course pages routinely write a
 deadline as "Due Sep. 13" with no year. Guessing "the next September 13" would
@@ -174,6 +182,29 @@ is how one assignments row produces two events: a release date and a deadline
 a fortnight later, labelled `ASSIGNED:` and `DUE:` so they are not confused for
 each other.
 
+**`[alarms]` decides what you are interrupted about**, per kind. The default is
+deliberately not "everything". Measured on the recorded course: 42 events, and
+before this section existed, 42 reminders — 30 of them telling a student to
+attend lectures that were already on a fixed timetable, 6 announcing that an
+assignment had been handed out, and 6 that were actually deadlines. A reminder
+stream that is 86% noise stops being read, and what it costs when that happens
+is the deadline. So reminders default to the kinds you can silently miss:
+
+| kind | reminder | why |
+|---|---|---|
+| `assignment_due` | **on** | a deadline is the one thing that passes without announcing itself |
+| `assignment_out` | off | the work cannot start before it exists; no advance warning is useful |
+| `lecture` | off | the timetable is already known, and recurring |
+| `no_class` | off | worth *seeing* on the calendar, not worth an alert |
+| `unknown` | **on** | conservative: a date the parser could not classify is the last one to silence |
+
+Every one of those is a line in `[alarms]`, and each takes `off`, `on`, or a
+number of days: `lecture = 1` restores the previous behaviour for lectures,
+`assignment_due = 3` moves deadline reminders three days out. `0` is a lead
+("at the event itself"), not an off switch — use `off` for that.
+`alarm_days_before` remains the default lead for every kind that has a reminder
+and no number of its own.
+
 ### Options
 
 | Flag | Effect |
@@ -185,7 +216,7 @@ each other.
 | `--diff` | Print a change report against the stored `state.json` (new / date changed / details changed / disappeared). |
 | `--dry-run` | Parse and report, write no files. Combines with `--list` and `--diff`. |
 | `--fall-year N` | Override the config's semester anchor. Changing it forces a full re-fetch, because a `304` would otherwise skip the re-parse. |
-| `--alarm-days N` | Override the reminder lead time, in days. `0` means at the event itself. |
+| `--alarm-days N` | Override the default reminder lead time, in days. `0` means at the event itself. It changes *when* reminders fire, not *which* kinds get one — that is `[alarms]`. |
 
 `--diff` and `--list` print to **stdout**; progress and failures go to
 **stderr**, so `python3 -m courseics --out-dir live --diff > report.txt` gives
@@ -200,10 +231,12 @@ gitignored as run artifacts.
 
 ### `schedule.ics`
 
-RFC 5545, CRLF line endings, folded at 75 octets. One `VEVENT` per record, each
-with one `VALARM`.
+RFC 5545, CRLF line endings, folded at 75 octets. One `VEVENT` per record; a
+`VALARM` on the kinds `[alarms]` says to remind you about, and on no others. On
+the recorded course that is 42 events carrying 6 reminders, one per deadline.
 
-- Lectures and release dates are all-day events. Deadlines are timed.
+- Lectures, release dates and no-class days are all-day events. Deadlines are
+  timed.
 - `SUMMARY` says which kind of date it is:
 
   | Record | `SUMMARY` |
@@ -211,7 +244,8 @@ with one `VALARM`.
   | lecture | `Sampling Based Algorithms II` |
   | assignment released | `ASSIGNED: Assignment 3 - Trajectory Following` |
   | assignment deadline | `DUE: Assignment 3 - Trajectory Following` |
-  | anything uncertain | prefixed `[?]`, e.g. `[?] Labor Day - no class` |
+  | a day with no class | `NO CLASS: Labor Day - no class` |
+  | anything uncertain | prefixed `[?]`, e.g. `[?] Guest lecture TBD` |
 
 - `DESCRIPTION` carries the kind, the confidence, every reason the parser
   recorded (including where the year came from), the raw source line, and the
@@ -226,7 +260,7 @@ and it stays one calendar.
 | kind | identified by | so this is an in-place update | and this replaces the event |
 |---|---|---|---|
 | `assignment_due`, `assignment_out`, `unknown` | source + **title** + kind | the deadline moves | the item is renamed |
-| `lecture` | source + **date** + kind | the session is retitled | the session moves to another day |
+| `lecture`, `no_class` | source + **date** + kind | the session is retitled | the session moves to another day |
 
 An assignment is an artefact — `Assignment 2` rescheduled is still
 `Assignment 2`. A lecture is a slot — the 9 Sep session is the 9 Sep session,
@@ -240,10 +274,19 @@ those rows, because it is the only thing that tells them apart. Those rows lose
 the guarantee in the third column above. See [`DESIGN.md`](DESIGN.md) §7
 and §14.
 
-> **Upgrading from an earlier version:** the lecture key changed, so on the
-> first run after upgrading, every existing **lecture** event is replaced once
-> and anything you attached to one is lost. Assignment events are unaffected —
-> they hash exactly what they hashed before. This is a one-off.
+> **Upgrading from an earlier version:** two changes rotate `UID`s, both once
+> and both on the first run after upgrading.
+>
+> 1. **The lecture key changed** (title → date), so every existing **lecture**
+>    event is replaced once.
+> 2. **Rows that say the class does not meet became their own kind**
+>    (`lecture` → `no_class`), and the kind is part of the hash. On the
+>    recorded course that is exactly two rows — `Labor Day - no class` and
+>    `Fall break - No class`. In a subscribed calendar they are removed and
+>    re-added, now reading `NO CLASS: …` instead of `[?] …`.
+>
+> Anything you attached to a replaced event is lost. Assignment events are
+> unaffected by either change — they hash exactly what they hashed before.
 
 ### `state.json`
 
@@ -276,20 +319,69 @@ on stderr rather than swallowed.
 `uncertain` records **are still published**, prefixed `[?]`, with the reasons
 in the description. Missing a real deadline is worse than showing a doubtful
 one, and a flagged event is something you can check in five seconds; an event
-that was never emitted is invisible. On the recorded pages the two uncertain
-records are `Labor Day - no class` and `Fall break - No class` — genuine
-calendar entries, correctly flagged as not ordinary lectures.
+that was never emitted is invisible. The recorded pages currently produce no
+uncertain records at all: the only two they used to produce were the holidays,
+which are now stated rather than flagged (below).
 
 A record is downgraded when:
 
 - the page's year disagrees with the semester anchor (the page still wins);
 - a weekday name next to the date does not match that date;
-- negation or correction words are nearby — `cancelled`, `moved to`, `TBD`,
-  `no class`, `rescheduled`, …;
+- negation or correction words are nearby — `moved to`, `TBD`, `rescheduled`,
+  `subject to change`, …;
 - a relative expression is in the same context — `next week`, `tomorrow`;
 - a second, un-cued date shares the line;
 - a lowercase `may` is not corroborated by a year or a due cue, because it is
   a modal verb far more often than a month.
+
+### "No class" is a statement, not a doubt
+
+`cancelled` and `no class` used to sit in that list beside `TBD` and
+`may change`, and they do not belong there. `TBD` is a page being unsure;
+`no class` is a page being certain, about the one thing you most need to read
+correctly. The recorded schedule published its two holidays as
+`[?] Labor Day - no class` and `[?] Fall break - No class`, where `[?]` means
+"this program could not work out what this row is" — on the two days of the
+semester when being wrong means turning up to a locked room.
+
+A row on a `lecture` page becomes a **`no_class`** record — `certain`, no
+`[?]`, `NO CLASS:` in the summary, no reminder — when its own text says the
+class does not meet:
+
+- an explicit negation: `no class`, `no classes`, `no lecture`, `no lab`,
+  `class does not meet`, `we will not meet`;
+- a cancellation: `cancelled` or `canceled`;
+- a named academic recess **as the row's entire title**: `Fall break`,
+  `Spring recess`, `Thanksgiving break`, `Holiday`.
+
+It **declines to fire** — leaving the row exactly where it was, a `[?]`
+lecture with the reason recorded — when:
+
+- the sentence is conditional or provisional: `if`, `unless`, `in case`,
+  `might`, `possibly`, `tentative`, `subject to change`, `TBD`. An announcement
+  reading *"there will be no class if it snows"* states a possibility, not a
+  fact;
+- the cancellation is denied: *"the class is **not** cancelled"*;
+- the class **moved** rather than vanished (`moved to`, `rescheduled`,
+  `postponed`), because where it landed is not something this parser can read
+  off the page;
+- the page is not one whose plain dates are class meetings. On an assignments
+  page, `Assignment 4 cancelled` cancels an assignment.
+
+The two lists are not symmetric, on purpose. A miss costs you the flagged
+lecture you already had and can read in five seconds. A false positive prints
+`NO CLASS` at confidence `certain` over a lecture that is happening, and a
+student who believes it misses the class. So the recess vocabulary is a closed
+list anchored to the whole title — `break` and `holiday` are ordinary English
+words, and `Coffee break with the TAs` is not a recess — and anything hedged is
+declined. Both directions are tested, including the mutation tests that assert
+each rule is load-bearing: `TestNoClassIsADefiniteStatement`,
+`TestNoClassDoesNotOverTrigger` and `TestTheNoClassRulesAreLoadBearing`.
+
+What it does **not** do: it does not strip the page's own words out of the
+title, so the summary reads `NO CLASS: Labor Day - no class` rather than
+`NO CLASS: Labor Day`. And a bare `Labor Day` with no further wording stays an
+ordinary lecture — a proper noun is not a statement that nothing happens.
 
 ---
 
@@ -464,7 +556,7 @@ calendar stays at its last good version.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests -t .          # 362 tests, well under a second
+python3 -m unittest discover -s tests -t .          # 407 tests, well under a second
 python3 -m unittest discover -s tests -t . -v       # verbose
 python3 -m unittest tests.test_parse_confidence     # one module
 ```
@@ -512,7 +604,7 @@ launchd/                    run deploy.sh on a schedule, and notice when it stop
   uninstall.sh              unload it and delete the plist
   run.sh                    what launchd runs: rotate, run, log, alert
   status.sh                 last success / recent failures / how many, in one line
-tests/                      362 tests + the two recorded pages
+tests/                      407 tests + the two recorded pages
 DESIGN.md                   why every one of these is the way it is
 ```
 
@@ -536,6 +628,15 @@ each one. The ones most likely to bite:
   the zone. A legislature that changes daylight-saving rules invalidates them.
 - **Control characters from a page reach the terminal**, though not the ICS
   structure — `URL:` is percent-encoded and text properties are escaped.
+- **A cancellation the page words unusually is missed**, and stays a `[?]`
+  lecture. The `no_class` rule reads explicit statements and a closed list of
+  recess names, and declines anything hedged; `Labor Day` alone, or a row that
+  only strikes the topic through, is not recognised. This is the direction the
+  rule is deliberately wrong in — see
+  ["No class" is a statement](#no-class-is-a-statement-not-a-doubt).
+- **A row whose class *moved* is not resolved**, only flagged. `moved to`,
+  `rescheduled` and `postponed` leave the row a `[?]` lecture on its original
+  date; the tool does not try to work out where it landed.
 
 ---
 

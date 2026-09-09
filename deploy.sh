@@ -149,10 +149,30 @@ PYHOSTS
 ALLOWED_HOSTS="$ALLOWED_HOSTS $EXTRA_ALLOWED_HOSTS"
 [ -n "${ALLOWED_HOSTS// /}" ] || die "no hosts could be derived from $CONFIG" 1
 
+# Which kinds of event are supposed to carry a reminder. Not every event does
+# any more -- a lecture and a holiday are things to SEE, not to be alerted
+# about -- so "one VALARM per VEVENT" is no longer the invariant, and asserting
+# it would block every publish. What still has to hold is that the events which
+# ARE meant to have a reminder all have one, so the gate asks the parser's own
+# policy rather than keeping a second copy of it here that could drift.
+ALARM_KINDS=$(python3 - "$SRC_REPO" "$CONFIG" <<'PYALARMS'
+import sys
+try:
+    sys.path.insert(0, sys.argv[1])
+    from courseics.config import KINDS, load_config
+    from courseics.ics import alarm_lead
+    cfg = load_config(sys.argv[2])
+    print(" ".join(k for k in KINDS if alarm_lead(cfg, k) is not None))
+except Exception as exc:                       # noqa: BLE001
+    print("ERROR:%s: %s" % (type(exc).__name__, exc))
+    sys.exit(1)
+PYALARMS
+) || die "could not read the alarm policy out of $CONFIG: $ALARM_KINDS" 1
+
 set +e
 GATE_OUT=$(MIN_EVENTS="$MIN_EVENTS" SHRINK_PCT="$SHRINK_PCT" FORCE="$FORCE" \
     PREV_EVENTS="$PREV_EVENTS" ALLOWED_HOSTS="$ALLOWED_HOSTS" \
-    FORBIDDEN_PATTERNS="$FORBIDDEN_PATTERNS" \
+    FORBIDDEN_PATTERNS="$FORBIDDEN_PATTERNS" ALARM_KINDS="$ALARM_KINDS" \
     python3 - "$LIVE_ICS" <<'PYGATE'
 import os, re, sys
 
@@ -179,11 +199,45 @@ if al != alend:
     fail.append("VALARM unbalanced: %d BEGIN, %d END" % (al, alend))
 if uid != ev:
     fail.append("%d UIDs for %d VEVENTs" % (uid, ev))
-# Every event needs exactly one alarm. Counting BEGIN/END pairs is not enough:
-# deleting a whole VALARM block leaves the counts balanced and the reminder
-# gone.
-if al != ev:
-    fail.append("%d VALARMs for %d VEVENTs (an event has no reminder)" % (al, ev))
+# Every event that is SUPPOSED to have a reminder needs exactly one, and no
+# other event may have any. Counting BEGIN/END pairs is not enough: deleting a
+# whole VALARM block leaves the counts balanced and the reminder gone. So the
+# check walks the events and compares each one against the policy the parser
+# was configured with, rather than against a number.
+alarm_kinds = set(os.environ.get('ALARM_KINDS', '').split())
+events, cur = [], None
+for x in L:
+    if x == 'BEGIN:VEVENT':
+        cur = []
+    elif x == 'END:VEVENT':
+        if cur is not None:
+            events.append(cur)
+        cur = None
+    elif cur is not None:
+        cur.append(x)
+
+missing, spurious, unlabelled = 0, 0, 0
+for e in events:
+    kinds = [x[len('CATEGORIES:'):] for x in e if x.startswith('CATEGORIES:')]
+    alarms = sum(1 for x in e if x == 'BEGIN:VALARM')
+    if len(kinds) != 1:
+        unlabelled += 1
+        continue
+    want = 1 if kinds[0] in alarm_kinds else 0
+    if alarms < want:
+        missing += 1
+    elif alarms > want:
+        spurious += 1
+if unlabelled:
+    fail.append("%d VEVENT(s) carry no single CATEGORIES line, so their "
+                "reminder cannot be checked" % unlabelled)
+if missing:
+    fail.append("%d event(s) of a kind that should be reminded about (%s) "
+                "have no VALARM"
+                % (missing, ", ".join(sorted(alarm_kinds)) or "none"))
+if spurious:
+    fail.append("%d event(s) carry a VALARM the configured alarm policy does "
+                "not call for" % spurious)
 
 uids = [x[4:] for x in L if x.startswith('UID:')]
 if len(set(uids)) != len(uids):
@@ -288,7 +342,7 @@ if [ "$GATE_RC" -ne 0 ]; then
     die "the output did not pass the gates (above). Nothing is published." 3
 fi
 
-ok "structure sound ($NEW_EVENTS VEVENTs, each with one VALARM and a unique UID; CRLF and folding correct)"
+ok "structure sound ($NEW_EVENTS VEVENTs, a unique UID each, a VALARM on exactly the kinds the config asks for ($ALARM_KINDS); CRLF and folding correct)"
 ok "privacy gate passed (hosts limited to: $ALLOWED_HOSTS)"
 if [ "$PREV_EVENTS" -gt 0 ]; then
     ok "scale plausible ($NEW_EVENTS events; $PREV_EVENTS published)"

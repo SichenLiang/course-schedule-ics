@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .config import (KIND_ASSIGNMENT_DUE, KIND_ASSIGNMENT_OUT, KIND_LECTURE,
-                     KIND_UNKNOWN, Config, SemesterAnchor)
+                     KIND_NO_CLASS, KIND_UNKNOWN, Config, SemesterAnchor)
 
 CERTAIN = "certain"
 UNCERTAIN = "uncertain"
@@ -15,7 +15,8 @@ UNCERTAIN = "uncertain"
 __all__ = [
     "CERTAIN", "UNCERTAIN",
     "KIND_LECTURE", "KIND_ASSIGNMENT_OUT", "KIND_ASSIGNMENT_DUE",
-    "KIND_UNKNOWN", "Record", "Dropped", "parse_line", "parse_page",
+    "KIND_NO_CLASS", "KIND_UNKNOWN", "Record", "Dropped", "parse_line",
+    "parse_page",
     "assign_uids", "dedupe", "DATE_KEYED_KINDS",
 ]
 
@@ -143,6 +144,111 @@ NEGATION_RE = re.compile(
     r"(?i)\b(not|instead\s+of|moved\s+to|rescheduled|reschedule|cancell?ed|"
     r"cancel|postponed|no\s+class|tbd|tba|may\s+change|subject\s+to\s+change)\b"
 )
+
+# --------------------------------------------------------------------------
+# "the class does not meet that day"
+# --------------------------------------------------------------------------
+#
+# Two of NEGATION_RE's words -- "no class" and "cancelled" -- are not hedges at
+# all. Everything else in that list marks a date the page is UNSURE about
+# ("TBD", "may change", "moved to"); these two mark a date the page is
+# perfectly sure about, and what it is sure of is that nothing happens. Sharing
+# one rule published the recorded course's two holidays as
+#
+#     [?] Labor Day - no class
+#     [?] Fall break - No class
+#
+# where the `[?]` says "this program could not work out what this row means".
+# It could: the row says it outright. A definite statement was being displayed
+# as a doubtful one, on the two days of the semester when being wrong means
+# turning up to a locked room.
+#
+# The vocabulary here is deliberately NARROWER than NEGATION_RE's, and the
+# trade is stated once so it is not re-litigated per phrase: a miss costs the
+# old `[?] lecture`, which is what the user has today and can read; a false
+# positive publishes "NO CLASS" at confidence `certain` over a lecture that is
+# actually happening, and a student who trusts it misses the class. The two
+# outcomes are not comparable, so where the wording is at all open, the rule
+# declines to fire.
+#
+# Three things follow from that, and each of them is a rule below:
+#
+#   1. Only an explicit statement counts (NO_CLASS_RE). A date sitting next to
+#      the bare word "Thanksgiving" is not one.
+#   2. A recess NAME counts, but only when it is the WHOLE title
+#      (RECESS_TITLE_RE) and only from a closed list. "Fall break" as a row's
+#      entire title is a recess; "break" loose in a sentence is a coffee break,
+#      a break-out group, or a page telling you when to take one.
+#   3. Anything that makes the claim conditional or provisional cancels it
+#      (NO_CLASS_HEDGE_RE), including the announcement shape
+#      "there will be no class if it snows", which states a possibility rather
+#      than a fact.
+#
+# All three are checked against the title -- the text this particular date owns
+# -- except the hedge, which is checked against the whole line. That asymmetry
+# is on purpose: a cue must belong to THIS date before it can promote it, while
+# a hedge anywhere in the sentence is reason enough to hold back, and holding
+# back is the cheap mistake.
+NO_CLASS_RE = re.compile(
+    r"(?i)(?:"
+    # "no class" / "no classes" / "no lecture" / "no lab" / "no meeting" ...
+    r"\bno\s+(?:class(?:es)?|lecture(?:s)?|lab(?:s)?|session(?:s)?|"
+    r"meeting(?:s)?|school)\b"
+    # "class does not meet", "we will not meet"
+    r"|\b(?:class(?:es)?|lecture(?:s)?|lab|session|meeting|we)\s+"
+    r"(?:will\s+|do(?:es)?\s+)?not\s+meet\b"
+    # A bare "cancelled" is already a complete statement: whatever the row
+    # names, it is not happening. Both spellings.
+    r"|\bcancell?ed\b"
+    r")"
+)
+
+# The closed list of academic recesses. Closed for the same reason MONTH_TOKENS
+# is: an open-ended pattern over words as ordinary as "break" and "holiday"
+# cannot be reasoned about, and this rule is one whose false positives are
+# expensive.
+_RECESS_NAMES = (r"fall|spring|winter|summer|thanksgiving|reading|study|"
+                 r"midterm|mid[-\s]?semester|semester|easter|christmas")
+RECESS_TITLE_RE = re.compile(
+    r"(?i)^(?:"
+    r"(?:" + _RECESS_NAMES + r")\s+(?:break|recess|holiday|vacation)s?"
+    r"|(?:university|school|college|academic|public|national|federal)\s+"
+    r"holidays?"
+    r"|holidays?|break|recess|vacation"
+    r")$"
+)
+
+# Wording that turns a cancellation into a possibility, a plan, or the
+# opposite. Any of it and the row keeps the behaviour it has today: a lecture,
+# flagged `[?]`, with the reason spelled out in the DESCRIPTION.
+NO_CLASS_HEDGE_RE = re.compile(
+    r"(?i)(?:"
+    # conditional and hypothetical: "there will be no class if it snows"
+    r"\bif\b|\bunless\b|\bin\s+case\b|\bin\s+the\s+event\b|\bwhether\b"
+    r"|\bmight\b|\bmay\s+be\b|\bpossibl[ey]\b|\bpotentially\b"
+    r"|\btentativ(?:e|ely)\b|\bsubject\s+to\s+change\b|\bmay\s+change\b"
+    r"|\btbd\b|\btba\b"
+    # the negation of the cancellation: "the class is NOT cancelled"
+    r"|\b(?:not|n't)\s+(?:be\s+|being\s+)?cancell?ed\b"
+    r"|\bno\s+longer\s+cancell?ed\b"
+    # a class that MOVED still happens; where it lands is something this
+    # parser cannot read off the page, so it is not published as a fact
+    # either way.
+    r"|\bmoved\s+to\b|\breschedul(?:e|ed|ing)\b|\bpostponed\b"
+    r"|\binstead\s+of\b"
+    r")"
+)
+
+
+# Which page conventions a no-class day can be read out of. Only a page whose
+# plain dates ARE class meetings can have one: on an assignments page
+# "Assignment 4 cancelled" cancels an assignment, and on a page whose
+# convention is `unknown` there is by definition no established meaning to
+# overrule. Named rather than written inline so the restriction is visible,
+# and so a guard can assert that removing it costs something.
+NO_CLASS_SOURCE_KINDS = frozenset([KIND_LECTURE])
+
+
 RELATIVE_ONLY_RE = re.compile(
     r"(?i)\b(next\s+week|this\s+week|last\s+week|tomorrow|today|"
     r"end\s+of\s+(?:the\s+)?(?:week|month|semester))\b"
@@ -177,7 +283,12 @@ NOISE_LINES = {
 #
 # `unknown` carries no page convention behind it, so it keeps the conservative
 # title key rather than inheriting a guess about which half is stable.
-DATE_KEYED_KINDS = frozenset([KIND_LECTURE])
+#
+# `no_class` joins it for the same reason: a holiday row is a slot on the
+# lecture schedule that happens to be empty, and its identity is the day. The
+# kind is in the hash, so a row that changes from `lecture` to `no_class`
+# rotates its UID once -- see README's upgrade note.
+DATE_KEYED_KINDS = frozenset([KIND_LECTURE, KIND_NO_CLASS])
 
 
 @dataclass
@@ -278,6 +389,47 @@ def _find_time(text: str) -> Optional[str]:
     if hour > 23 or minute > 59:
         return None
     return "%02d:%02d" % (hour, minute)
+
+
+def _negation_words(text: str) -> List[str]:
+    """Every NEGATION_RE keyword in `text`, normalised for comparison."""
+    return [re.sub(r"\s+", " ", m.group(0).strip().lower())
+            for m in NEGATION_RE.finditer(text)]
+
+
+def _surviving_negations(line: str, cue: Optional[str]) -> List[str]:
+    """The negation words on `line` that are not part of `cue`.
+
+    A record produced BY a negation may not also be downgraded by it: the row
+    says "no class", and "no class" is therefore not evidence that the row is
+    doubtful. The excuse is scoped to the cue that was actually matched rather
+    than to a fixed word list, so every phrasing NO_CLASS_RE learns is covered
+    automatically -- including "class does not meet", whose "not" is likewise
+    the cue and not a doubt.
+
+    Any other negation word on the line still downgrades the record, because
+    those are about the date rather than about the cancellation.
+    """
+    words = _negation_words(line)
+    if not cue:
+        return words
+    excused = set(_negation_words(cue))
+    return [w for w in words if w not in excused]
+
+
+def _no_class_cue(title: str) -> Optional[str]:
+    """The phrase saying this row is a day with no class, or None.
+
+    Reads the title -- the text this one date owns -- not the whole line, so a
+    cancellation belonging to a neighbouring date cannot promote this one.
+    """
+    m = NO_CLASS_RE.search(title)
+    if m:
+        return m.group(0).strip()
+    m = RECESS_TITLE_RE.match(title.strip())
+    if m:
+        return m.group(0).strip()
+    return None
 
 
 @dataclass
@@ -487,6 +639,33 @@ def parse_line(line: str, source_url: str, default_kind: str,
             reasons.append("assignment-related date with no explicit due cue "
                            "and no page convention to fall back on")
 
+        # --- a day with no class ---
+        # Only a page whose plain dates ARE class meetings can have one. On an
+        # assignments page "Assignment 4 cancelled" cancels an assignment, not
+        # a lecture, and on a page whose convention is `unknown` there is by
+        # definition no established meaning to overrule -- so neither is
+        # promoted. This is the narrow reading on purpose; see NO_CLASS_RE.
+        hedged = None  # type: Optional[str]
+        no_class_cue = None  # type: Optional[str]
+        if kind in NO_CLASS_SOURCE_KINDS:
+            cue = _no_class_cue(title)
+            if cue:
+                hedge = NO_CLASS_HEDGE_RE.search(stripped)
+                if hedge:
+                    hedged = hedge.group(0).strip()
+                    reasons.append(
+                        "reads like a cancellation (%r) but the line also "
+                        "says %r, which makes it conditional or provisional; "
+                        "kept as a lecture and flagged rather than published "
+                        "as a certain no-class day" % (cue, hedged))
+                else:
+                    kind = KIND_NO_CLASS
+                    no_class_cue = cue
+                    reasons.append(
+                        "the row states outright that the class does not meet "
+                        "(%r), which is a definite statement rather than a "
+                        "doubtful one" % cue)
+
         # --- confidence ---
         if year_conflict:
             # The explaining reason is already in year_reasons.
@@ -505,9 +684,15 @@ def parse_line(line: str, source_url: str, default_kind: str,
             conf = UNCERTAIN
             reasons.append("lowercase 'may' is more often a verb than a month")
         if negated:
+            kws = _surviving_negations(stripped, no_class_cue)
+            if kws:
+                conf = UNCERTAIN
+                reasons.append("negation/correction word %r near the date"
+                               % kws[0])
+        if hedged:
+            # A cancellation this program could not confirm is exactly the
+            # case `[?]` exists for, whether or not NEGATION_RE also fired.
             conf = UNCERTAIN
-            kw = NEGATION_RE.search(stripped).group(0)
-            reasons.append("negation/correction word %r near the date" % kw)
         if relative:
             conf = UNCERTAIN
             reasons.append("relative date expression in the same context")

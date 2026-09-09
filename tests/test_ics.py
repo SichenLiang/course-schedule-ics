@@ -3,14 +3,15 @@
 import contextlib
 import datetime as dt
 import hashlib
+import re
 import unittest
 
 from courseics import parse as parse_mod
-from courseics.config import Config
-from courseics.ics import build_calendar, escape, fold, uri_value
+from courseics.config import KINDS, Config
+from courseics.ics import alarm_lead, build_calendar, escape, fold, uri_value
 from courseics.parse import (CERTAIN, KIND_ASSIGNMENT_DUE, KIND_ASSIGNMENT_OUT,
-                           KIND_LECTURE, KIND_UNKNOWN, UNCERTAIN, Record,
-                           assign_uids)
+                           KIND_LECTURE, KIND_NO_CLASS, KIND_UNKNOWN,
+                           UNCERTAIN, Record, assign_uids)
 
 URL = "https://example.invalid/lectures"
 NOW = dt.datetime(2026, 9, 2, 12, 0, 0, tzinfo=dt.timezone.utc)
@@ -92,7 +93,9 @@ class TestUriValuedProperties(unittest.TestCase):
             self.assertNotIn("\r", value)
 
     def test_a_url_carrying_a_newline_injects_nothing(self):
-        record = rec()
+        # A deadline, because the structure being asserted below includes the
+        # VALARM block and only an alarm-bearing kind emits one.
+        record = rec(kind=KIND_ASSIGNMENT_DUE)
         record.source_url = "https://a.example/\r\nBEGIN:VALARM\r\nX-EVIL:1"
         text = cal([record])
         unfolded = text.replace("\r\n ", "")
@@ -124,11 +127,25 @@ class TestCalendarStructure(unittest.TestCase):
         self.assertEqual(out.count("\r\n"), out.count("\n"))
 
     def test_every_event_is_balanced(self):
-        out = cal([rec(), rec(date="2026-09-09", title="Two")])
+        out = cal([rec(title="A1", kind=KIND_ASSIGNMENT_DUE),
+                   rec(date="2026-09-09", title="A2",
+                       kind=KIND_ASSIGNMENT_DUE)])
         self.assertEqual(out.count("BEGIN:VEVENT"), 2)
         self.assertEqual(out.count("END:VEVENT"), 2)
         self.assertEqual(out.count("BEGIN:VALARM"), 2)
         self.assertEqual(out.count("END:VALARM"), 2)
+
+    def test_an_event_with_no_alarm_is_still_balanced(self):
+        # Most kinds now emit no VALARM at all. Omitting the block must leave
+        # the event structurally intact -- a stray END:VALARM, or a VEVENT
+        # that never closes, is a file no client will read.
+        out = cal([rec(), rec(date="2026-09-09", title="Two")])
+        self.assertEqual(out.count("BEGIN:VEVENT"), 2)
+        self.assertEqual(out.count("END:VEVENT"), 2)
+        self.assertEqual(out.count("BEGIN:VALARM"), 0)
+        self.assertEqual(out.count("END:VALARM"), 0)
+        for block in out.split("BEGIN:VEVENT")[1:]:
+            self.assertIn("END:VEVENT", block)
 
     def test_all_day_event_uses_value_date(self):
         out = cal([rec()])
@@ -264,19 +281,97 @@ class TestUncertainRendering(unittest.TestCase):
         self.assertIn("no class", unfolded)
 
 
-class TestAlarms(unittest.TestCase):
+DUE = dict(kind=KIND_ASSIGNMENT_DUE, title="Assignment 1")
+
+
+class TestAlarmLeadTime(unittest.TestCase):
+    """How far ahead an alarm fires, for a kind that has one at all."""
+
     def test_default_is_one_day_before(self):
-        self.assertIn("TRIGGER:-P1D", cal([rec()]))
+        self.assertIn("TRIGGER:-P1D", cal([rec(**DUE)]))
 
     def test_alarm_lead_is_configurable(self):
         cfg = zoned()
         cfg.alarm_days_before = 3
-        self.assertIn("TRIGGER:-P3D", cal([rec()], cfg))
+        self.assertIn("TRIGGER:-P3D", cal([rec(**DUE)], cfg))
 
     def test_zero_days_means_at_start(self):
         cfg = zoned()
         cfg.alarm_days_before = 0
-        self.assertIn("TRIGGER:-PT0M", cal([rec()], cfg))
+        self.assertIn("TRIGGER:-PT0M", cal([rec(**DUE)], cfg))
+
+    def test_a_per_kind_lead_overrides_the_global_one(self):
+        cfg = zoned()
+        cfg.alarm_days_before = 1
+        cfg.alarm_days_by_kind = {KIND_ASSIGNMENT_DUE: 5}
+        self.assertIn("TRIGGER:-P5D", cal([rec(**DUE)], cfg))
+
+    def test_a_kind_with_no_override_still_follows_the_global_one(self):
+        cfg = zoned()
+        cfg.alarm_days_before = 2
+        cfg.alarm_kinds = frozenset([KIND_ASSIGNMENT_DUE, KIND_LECTURE])
+        cfg.alarm_days_by_kind = {KIND_LECTURE: 7}
+        out = cal([rec(**DUE), rec(date="2026-09-09", title="Slot")], cfg)
+        self.assertIn("TRIGGER:-P2D", out)
+        self.assertIn("TRIGGER:-P7D", out)
+
+
+class TestWhichKindsAreRemindedAbout(unittest.TestCase):
+    """The default alarm policy, kind by kind.
+
+    Every event used to carry a VALARM. On the recorded course that was 42
+    reminders for 6 deadlines: 30 of them told a student to go to a lecture he
+    was already going to, and 6 more announced that an assignment had been
+    handed out -- a fact he learns by reading the assignment. Each row of the
+    table below is asserted rather than described, because "the default is
+    sensible" is exactly the kind of claim that rots.
+    """
+
+    def _alarms(self, kind, **kw):
+        out = cal([rec(kind=kind, **kw)])
+        return out.count("BEGIN:VALARM")
+
+    def test_a_deadline_is_reminded_about(self):
+        self.assertEqual(self._alarms(KIND_ASSIGNMENT_DUE), 1)
+
+    def test_a_release_date_is_not(self):
+        self.assertEqual(self._alarms(KIND_ASSIGNMENT_OUT), 0)
+
+    def test_a_lecture_is_not(self):
+        self.assertEqual(self._alarms(KIND_LECTURE), 0)
+
+    def test_a_no_class_day_is_not(self):
+        self.assertEqual(self._alarms(KIND_NO_CLASS), 0)
+
+    def test_an_unknown_date_is_reminded_about(self):
+        # The conservative half of the rule: a date whose meaning the parser
+        # could not establish is the last one to silence.
+        self.assertEqual(self._alarms(KIND_UNKNOWN), 1)
+
+    def test_a_silenced_kind_still_appears_in_the_calendar(self):
+        # No alarm is not the same as no event: the whole point of keeping a
+        # no-class day is that the reader can see the day is empty.
+        out = cal([rec(kind=KIND_NO_CLASS, title="Fall break - No class")])
+        self.assertIn("SUMMARY:NO CLASS: Fall break - No class", out)
+        self.assertNotIn("BEGIN:VALARM", out)
+
+
+class TestAlarmPolicyIsConfigurable(unittest.TestCase):
+    """The policy above is a default, not a decision taken for the user."""
+
+    def test_lectures_can_be_switched_back_on(self):
+        cfg = zoned()
+        cfg.alarm_kinds = frozenset([KIND_ASSIGNMENT_DUE, KIND_LECTURE])
+        self.assertEqual(cal([rec()], cfg).count("BEGIN:VALARM"), 1)
+
+    def test_deadlines_can_be_switched_off(self):
+        cfg = zoned()
+        cfg.alarm_kinds = frozenset()
+        self.assertEqual(cal([rec(**DUE)], cfg).count("BEGIN:VALARM"), 0)
+
+    def test_alarm_lead_returns_none_for_a_silenced_kind(self):
+        self.assertIsNone(alarm_lead(zoned(), KIND_LECTURE))
+        self.assertEqual(alarm_lead(zoned(), KIND_ASSIGNMENT_DUE), 1)
 
 
 class TestUidStability(unittest.TestCase):
@@ -605,7 +700,109 @@ class TestTheIdentityRuleIsLoadBearing(unittest.TestCase):
         # The two guards above mutate module state; if the restore ever broke,
         # every later test would be running against the wrong rule.
         self.assertEqual(parse_mod.DATE_KEYED_KINDS,
+                         frozenset([KIND_LECTURE, KIND_NO_CLASS]))
+
+
+@contextlib.contextmanager
+def patched(module, **attrs):
+    """Temporarily rebind module attributes, restoring them afterwards."""
+    original = {name: getattr(module, name) for name in attrs}
+    for name, value in attrs.items():
+        setattr(module, name, value)
+    try:
+        yield
+    finally:
+        for name, value in original.items():
+            setattr(module, name, value)
+
+
+NEVER = re.compile(r"(?!x)x")          # matches nothing, anywhere
+LABOR_DAY = "Sep. 07, 2026 Labor Day - no class"
+SNOW = "Oct. 12, 2026 There will be no class if it snows"
+
+
+def parsed(line, kind=KIND_LECTURE):
+    rs = parse_mod.parse_line(line, URL, kind, Config())
+    assert len(rs) == 1, rs
+    return rs[0]
+
+
+class TestTheAlarmPolicyIsLoadBearing(unittest.TestCase):
+    """Undo the alarm rule and the "only deadlines" invariant must go red."""
+
+    def test_reverting_to_an_alarm_on_every_kind_breaks_it(self):
+        cfg = zoned()
+        cfg.alarm_kinds = frozenset(KINDS)          # the pre-change behaviour
+        out = cal([rec(), rec(date="2026-09-09", kind=KIND_NO_CLASS,
+                              title="Fall break")], cfg)
+        # Under the old rule these two silenced kinds are noisy again, which
+        # is exactly what TestWhichKindsAreRemindedAbout asserts they are not.
+        self.assertEqual(out.count("BEGIN:VALARM"), 2)
+
+
+class TestTheNoClassRulesAreLoadBearing(unittest.TestCase):
+    """One mutation per rule that decides whether a row is a no-class day.
+
+    A regression test that still passes when the code it guards is reverted is
+    guarding nothing, so each rule is paired here with the smallest edit that
+    undoes it, and the pair asserts that the invariant does NOT hold under
+    that edit. Both directions are guarded: the rules that make the two real
+    holidays certain, and the rules that stop everything else from joining
+    them.
+    """
+
+    def test_without_the_cue_the_holidays_go_back_to_being_flagged(self):
+        with patched(parse_mod, NO_CLASS_RE=NEVER, RECESS_TITLE_RE=NEVER):
+            r = parsed(LABOR_DAY)
+        self.assertEqual(r.kind, KIND_LECTURE)
+        self.assertEqual(r.confidence, UNCERTAIN)
+        self.assertIn("[?] ", cal([r]))
+
+    def test_without_the_hedge_guard_a_conditional_becomes_a_fact(self):
+        # "there will be no class IF it snows" is the announcement shape that
+        # reads word-for-word like a cancellation and is not one.
+        with patched(parse_mod, NO_CLASS_HEDGE_RE=NEVER):
+            r = parsed(SNOW)
+        self.assertEqual(r.kind, KIND_NO_CLASS)
+        self.assertEqual(r.confidence, CERTAIN)
+
+    def test_without_the_whole_title_anchor_a_coffee_break_is_a_recess(self):
+        # RECESS_TITLE_RE is anchored to the WHOLE title on purpose. Let the
+        # same words count wherever they appear -- which is how the rule
+        # would read if it were written the obvious way -- and it swallows
+        # ordinary rows.
+        loose = re.compile(r"(?i).*\b(?:break|recess|holiday|vacation)s?\b")
+        with patched(parse_mod, RECESS_TITLE_RE=loose):
+            r = parsed("Oct. 12, 2026 Coffee break with the TAs")
+        self.assertEqual(r.kind, KIND_NO_CLASS)
+
+    def test_without_the_page_restriction_a_cancelled_assignment_joins_in(self):
+        with patched(parse_mod, NO_CLASS_SOURCE_KINDS=frozenset(KINDS)):
+            r = parsed("Oct. 12, 2026 Assignment 4 cancelled",
+                       kind=KIND_ASSIGNMENT_OUT)
+        self.assertEqual(r.kind, KIND_NO_CLASS)
+
+    def test_without_the_scoped_excuse_the_row_doubts_itself_again(self):
+        # The phrase that PRODUCED the record downgrading the record it just
+        # produced is the original bug, in miniature.
+        with patched(parse_mod,
+                     _surviving_negations=lambda line, cue:
+                     parse_mod._negation_words(line)):
+            r = parsed(LABOR_DAY)
+        self.assertEqual(r.kind, KIND_NO_CLASS)
+        self.assertEqual(r.confidence, UNCERTAIN)
+        self.assertIn("[?] NO CLASS: ", cal([r]))
+
+    def test_every_rebinding_is_undone(self):
+        self.assertNotEqual(parse_mod.NO_CLASS_RE, NEVER)
+        self.assertNotEqual(parse_mod.RECESS_TITLE_RE, NEVER)
+        self.assertNotEqual(parse_mod.NO_CLASS_HEDGE_RE, NEVER)
+        self.assertEqual(parse_mod.NO_CLASS_SOURCE_KINDS,
                          frozenset([KIND_LECTURE]))
+        # And the real rules still hold, run once more after the mutations.
+        r = parsed(LABOR_DAY)
+        self.assertEqual((r.kind, r.confidence), (KIND_NO_CLASS, CERTAIN))
+        self.assertEqual(parsed(SNOW).kind, KIND_LECTURE)
 
 
 if __name__ == "__main__":

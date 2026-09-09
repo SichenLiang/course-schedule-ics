@@ -4,8 +4,8 @@ import datetime as dt
 from typing import List, Optional
 
 from .config import Config
-from .parse import (KIND_ASSIGNMENT_DUE, KIND_ASSIGNMENT_OUT, UNCERTAIN,
-                    Record)
+from .parse import (KIND_ASSIGNMENT_DUE, KIND_ASSIGNMENT_OUT, KIND_NO_CLASS,
+                    UNCERTAIN, Record)
 from .timezones import VTIMEZONES
 
 PRODID = "-//course-schedule-ics//course schedule 0.1//EN"
@@ -17,6 +17,10 @@ PRODID = "-//course-schedule-ics//course schedule 0.1//EN"
 SUMMARY_PREFIX = {
     KIND_ASSIGNMENT_DUE: "DUE: ",
     KIND_ASSIGNMENT_OUT: "ASSIGNED: ",
+    # The one row a student most needs to read correctly at a glance, and the
+    # only prefix that says "do NOT come". It is a prefix like the other two,
+    # rather than a `[?]`, because it states a fact rather than a doubt.
+    KIND_NO_CLASS: "NO CLASS: ",
 }
 
 # A TZID names a zone; the file has to define it. The definitions live in
@@ -107,6 +111,23 @@ def _trigger(days: int) -> str:
     return "-P%dD" % days
 
 
+def alarm_lead(cfg: Config, kind: str) -> Optional[int]:
+    """Days before the event to fire a VALARM, or None for no VALARM at all.
+
+    The single place the alarm policy is read. It was previously not a policy:
+    every event got an alarm, which on the recorded course meant 42 reminders
+    for 6 deadlines. `cfg.alarm_kinds` decides whether a kind is reminded about
+    and `cfg.alarm_days_by_kind` how far ahead, falling back to the older
+    `cfg.alarm_days_before` -- which is what keeps that setting, and the
+    --alarm-days flag, doing what they always did for the kinds that still
+    have an alarm.
+    """
+    if kind not in cfg.alarm_kinds:
+        return None
+    override = cfg.alarm_days_by_kind.get(kind)
+    return cfg.alarm_days_before if override is None else override
+
+
 def build_event(rec: Record, cfg: Config, stamp: str) -> List[str]:
     date = dt.date.fromisoformat(rec.date)
     lines = ["BEGIN:VEVENT", "UID:%s" % rec.uid, "DTSTAMP:%s" % stamp]
@@ -145,11 +166,13 @@ def build_event(rec: Record, cfg: Config, stamp: str) -> List[str]:
     lines.append("URL:%s" % uri_value(rec.source_url))
     lines.append("CATEGORIES:%s" % escape(rec.kind))
 
-    lines.append("BEGIN:VALARM")
-    lines.append("ACTION:DISPLAY")
-    lines.append("TRIGGER:%s" % _trigger(cfg.alarm_days_before))
-    lines.append("DESCRIPTION:%s" % escape(summary))
-    lines.append("END:VALARM")
+    lead = alarm_lead(cfg, rec.kind)
+    if lead is not None:
+        lines.append("BEGIN:VALARM")
+        lines.append("ACTION:DISPLAY")
+        lines.append("TRIGGER:%s" % _trigger(lead))
+        lines.append("DESCRIPTION:%s" % escape(summary))
+        lines.append("END:VALARM")
     lines.append("END:VEVENT")
     return lines
 

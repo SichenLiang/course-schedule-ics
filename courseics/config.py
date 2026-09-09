@@ -18,8 +18,8 @@ hand-edit also wants comments, which JSON does not have.
 import configparser
 import os
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from .timezones import SUPPORTED_TIMEZONES, VTIMEZONES
 
@@ -64,11 +64,40 @@ KIND_LECTURE = "lecture"
 # date, the cued one is the deadline; these two names keep them apart.
 KIND_ASSIGNMENT_OUT = "assignment_out"
 KIND_ASSIGNMENT_DUE = "assignment_due"
+# A day the schedule lists but on which the class does not meet: a holiday, a
+# recess, a cancellation. It is a lecture slot in every way except that nothing
+# happens in it, and that is exactly why it is not a `lecture`: the reader has
+# to be able to tell "go to class" from "do not go to class" at a glance, and
+# a `[?]`-flagged lecture said neither. See parse.NO_CLASS_RE.
+KIND_NO_CLASS = "no_class"
 # For a source whose convention has not been established. Dates on such a page
 # get no `SUMMARY` prefix and no default time.
 KIND_UNKNOWN = "unknown"
 
-KINDS = (KIND_LECTURE, KIND_ASSIGNMENT_OUT, KIND_ASSIGNMENT_DUE, KIND_UNKNOWN)
+KINDS = (KIND_LECTURE, KIND_ASSIGNMENT_OUT, KIND_ASSIGNMENT_DUE,
+         KIND_NO_CLASS, KIND_UNKNOWN)
+
+# Which kinds carry a reminder unless the config says otherwise.
+#
+# The rule is "remind me about what I would otherwise miss", and it is not the
+# same as "everything on the calendar". Measured on the recorded course, every
+# one of the 42 events carried a VALARM, so a student who already goes to class
+# by the timetable was reminded 30 times a semester about lectures he was
+# attending anyway, 6 more times about assignment RELEASE dates, and 6 times
+# about the deadlines -- the only ones he needed. Noise at that ratio is how a
+# reminder stops being read, which costs the six that matter.
+#
+#   assignment_due  ON   -- a deadline is the one thing that is missed silently
+#   assignment_out  off  -- a release date needs no advance warning; the work
+#                           cannot start before it exists
+#   lecture         off  -- the timetable is already known and recurring
+#   no_class        off  -- worth SEEING on the calendar, not worth an alert
+#   unknown         ON   -- conservative: a date whose meaning the parser could
+#                           not establish is exactly the one not to silence
+#
+# Every one of these is overridable per kind in the config's [alarms] section,
+# because this is a defensible default rather than a universal truth.
+DEFAULT_ALARM_KINDS = frozenset((KIND_ASSIGNMENT_DUE, KIND_UNKNOWN))
 
 
 class ConfigError(Exception):
@@ -144,8 +173,17 @@ class Source:
 class Config:
     anchor: SemesterAnchor = DEFAULT_ANCHOR
     sources: Tuple[Source, ...] = ()
-    # VALARM lead time, in days before the event.
+    # VALARM lead time, in days before the event. The default for every kind
+    # that has an alarm at all; a kind may override it in `alarm_days_by_kind`.
     alarm_days_before: int = 1
+    # Which kinds get a VALARM. See DEFAULT_ALARM_KINDS for why the default is
+    # not "all of them", and `[alarms]` in config.example.ini for how to change
+    # it. `ics.alarm_lead` is the single place these two fields are read.
+    alarm_kinds: FrozenSet[str] = DEFAULT_ALARM_KINDS
+    # Per-kind lead-time overrides, in days. A kind absent from here and
+    # present in `alarm_kinds` uses `alarm_days_before`, which is what keeps
+    # the older `alarm_days_before` setting -- and --alarm-days -- meaningful.
+    alarm_days_by_kind: Dict[str, int] = field(default_factory=dict)
     # Clock time given to assignment_due events that carry no explicit time.
     default_due_time: str = "23:59"
     # IANA zone the page's wall-clock deadlines are written in. Must be a key
@@ -184,7 +222,7 @@ class Config:
 
 _TIME_RE = re.compile(r"^([0-9]{1,2}):([0-9]{2})$")
 _SOURCE_PREFIX = "source:"
-_KNOWN_SECTIONS = ("calendar", "semester", "fetch", "health")
+_KNOWN_SECTIONS = ("calendar", "semester", "fetch", "health", "alarms")
 
 
 def _fail(path: str, section: str, key: str, problem: str) -> "ConfigError":
@@ -230,6 +268,59 @@ def _get_float(parser, path, section, key, default, low=None, high=None):
     if high is not None and value > high:
         raise _fail(path, section, key, "is %g, above the maximum of %g" % (value, high))
     return value
+
+
+# Words that switch a kind's reminder off, and words that switch it on at the
+# default lead. Spelled out rather than passed to `bool()` because "0" has to
+# keep meaning "remind me, at the event itself" -- a lead of zero days is a
+# setting somebody wants, and reading it as false would silently delete their
+# reminder.
+_ALARM_OFF = ("off", "no", "none", "false", "never")
+_ALARM_ON = ("on", "yes", "true", "default")
+
+
+def _read_alarms(parser, path) -> Tuple[FrozenSet[str], Dict[str, int]]:
+    """The [alarms] section: which kinds get a VALARM, and how far ahead.
+
+    Absent section -> DEFAULT_ALARM_KINDS, each at `alarm_days_before`. A kind
+    named in the section overrides its default in both directions, so a user
+    who does want a nudge before every lecture writes `lecture = 1` and gets
+    exactly the behaviour this change took away from them.
+    """
+    kinds = set(DEFAULT_ALARM_KINDS)
+    by_kind = {}  # type: Dict[str, int]
+    if not parser.has_section("alarms"):
+        return frozenset(kinds), by_kind
+
+    for key in parser.options("alarms"):
+        kind = key.strip()
+        if kind not in KINDS:
+            raise _fail(path, "alarms", kind,
+                        "is not a record kind. One of: %s." % ", ".join(KINDS))
+        raw = parser.get("alarms", key).strip()
+        low = raw.lower()
+        if low in _ALARM_OFF:
+            kinds.discard(kind)
+            by_kind.pop(kind, None)
+            continue
+        if low in _ALARM_ON or raw == "":
+            kinds.add(kind)
+            by_kind.pop(kind, None)
+            continue
+        try:
+            days = int(raw)
+        except ValueError:
+            raise _fail(path, "alarms", kind,
+                        "is %r. Write a number of days before the event, or "
+                        "one of %s to switch the reminder off, or one of %s "
+                        "to use [calendar] alarm_days_before."
+                        % (raw, "/".join(_ALARM_OFF), "/".join(_ALARM_ON)))
+        if not 0 <= days <= 365:
+            raise _fail(path, "alarms", kind,
+                        "is %d days, outside the range 0-365" % days)
+        kinds.add(kind)
+        by_kind[kind] = days
+    return frozenset(kinds), by_kind
 
 
 def load_config(path: str) -> Config:
@@ -299,6 +390,9 @@ def load_config(path: str) -> Config:
     alarm_days = _get_int(parser, path, "calendar", "alarm_days_before", 1,
                           low=0, high=365)
 
+    # --- alarms ---------------------------------------------------------
+    alarm_kinds, alarm_by_kind = _read_alarms(parser, path)
+
     # --- fetch ----------------------------------------------------------
     contact = _get(parser, path, "fetch", "contact", "")
     interval = _get_float(parser, path, "fetch", "min_request_interval",
@@ -365,6 +459,8 @@ def load_config(path: str) -> Config:
         anchor=fall_anchor(fall_year),
         sources=tuple(sources),
         alarm_days_before=alarm_days,
+        alarm_kinds=alarm_kinds,
+        alarm_days_by_kind=alarm_by_kind,
         default_due_time=due_time,
         timezone=tz,
         max_shrink_ratio=max_shrink,

@@ -179,9 +179,14 @@ numbers. The information is destroyed at strip time; it cannot be restored.
 | **uncertain** | Emitted as a normal `VEVENT`, `SUMMARY` prefixed `[?]`, with every reason listed in the `DESCRIPTION`. |
 | **certain** | Emitted plain. |
 
-The middle tier is the point of the design. On the current pages it catches
-`Labor Day - no class` and `Fall break - No class` — real calendar entries that
-a student wants to see, but not as ordinary lectures.
+The middle tier is the point of the design: anything doubtful is published and
+labelled rather than dropped.
+
+Its original example is no longer one. `Labor Day - no class` and
+`Fall break - No class` were the two `uncertain` records on the recorded pages,
+and they were the wrong tier — see §4b. The current pages produce no
+`uncertain` records at all, which is a fact about these two pages and not a
+claim that the tier is unused; every trigger below still has its own test.
 
 Downgrade triggers, each with a test:
 
@@ -189,7 +194,8 @@ Downgrade triggers, each with a test:
 - a weekday name next to a date that does not match that date (§6)
 - negation or correction words: `not`, `instead of`, `moved to`,
   `rescheduled`, `cancelled`/`canceled`, `postponed`, `no class`, `TBD`/`TBA`,
-  `subject to change`
+  `subject to change` — **except** where the word is what identified the row
+  as a no-class day in the first place (§4b)
 - a relative expression in the same context: `next week`, `end of the semester`
 - a second, uncued date on a line that already has one
 - a lowercase `may` with nothing corroborating it (see §5)
@@ -220,6 +226,99 @@ list — discarding the rejections along with it. So `Feb. 30`, caught one step
 later by `date()`, was reported, while `Sep. 32`, `Sep. 0` and `Sep. 99`
 vanished without a word. Impossible days are now carried out of the scan
 separately and go through the same reporting path.
+
+---
+
+## 4b. A cancellation is a statement, not a doubt
+
+**The report.** A subscriber sent a screenshot of the live calendar. Two rows
+read:
+
+```
+[?] Labor Day - no class
+[?] Fall break - No class
+```
+
+`[?]` means "this program could not work out what this row means". It could:
+the row says so, in words. Both were `certain` statements published as doubtful
+ones, on the two days of the semester when being wrong means turning up to a
+locked room.
+
+**The cause.** `NEGATION_RE` had one list for two different things. Most of its
+words mark a page being *unsure* — `TBD`, `may change`, `subject to change`,
+`moved to`. Two of them — `no class`, `cancelled` — mark a page being *sure*,
+and what it is sure of is that nothing happens. Sharing one rule meant the
+phrase that identified the row also downgraded it.
+
+**Decision.** A fifth kind, `no_class`, and three rules that decide when a row
+becomes one.
+
+| | rule | scope |
+|---|---|---|
+| 1 | `NO_CLASS_RE` — an explicit statement: `no class`/`no lecture`/`no lab`, `class does not meet`, `cancelled` | the title, i.e. the text *this* date owns |
+| 2 | `RECESS_TITLE_RE` — a closed list of recess names, matched against the **whole** title | the title |
+| 3 | `NO_CLASS_HEDGE_RE` — anything conditional, provisional or inverted vetoes both of the above | the whole line |
+
+Plus a restriction: only a page whose plain dates *are* class meetings
+(`NO_CLASS_SOURCE_KINDS`) can produce one. On the assignments page,
+`Assignment 4 cancelled` cancels an assignment.
+
+A `no_class` record is `certain`, carries no `[?]`, is prefixed `NO CLASS:`,
+and gets no reminder (§8b) — it is a thing to *see*, not to be alerted about.
+
+**The asymmetry is the whole design.** A miss costs the reader the `[?]`
+lecture they already have and can check in five seconds. A false positive
+prints `NO CLASS` at `certain` over a lecture that is happening, and a student
+who believes it misses the class. Those two are not comparable, so where the
+wording is at all open the rule declines to fire. Three consequences:
+
+- **The recess list is closed and anchored to the whole title.** `break` and
+  `holiday` are ordinary English words. `Fall break` as a row's entire title is
+  a recess; `Coffee break with the TAs` is not, and an unanchored rule cannot
+  tell them apart. This is the same reasoning as `MONTH_TOKENS` in §5: a
+  vocabulary whose false positives are expensive is enumerated, not
+  approximated.
+- **The hedge veto is checked against the whole line, while the cue is checked
+  against one date's own title.** Deliberately asymmetric: a cue must belong to
+  *this* date before it may promote it, whereas a hedge anywhere in the
+  sentence is reason enough to hold back — and holding back is the cheap
+  mistake. The shape that motivated it is the announcement
+  *"there will be no class if it snows"*, which reads word for word like a
+  cancellation and is a statement about the weather.
+- **A class that *moved* is not resolved, only flagged.** `moved to`,
+  `rescheduled`, `postponed` all veto. The class does still happen; where it
+  landed is not something this parser can read off the page, and publishing
+  either "it happens here" or "nothing happens" would be a guess.
+
+**The negation excuse is scoped to the cue, not to a word list.** The words
+that *produced* the record may not also cast doubt on it, but every other
+negation word on the line still may — `Labor Day - no class, notes not posted`
+is a no-class day *and* worth a `[?]`. Excusing a fixed list of words would
+have missed `class does not meet`, whose `not` is likewise the cue. So the
+excuse is computed by running `NEGATION_RE` over the matched cue itself
+(`_surviving_negations`), which covers every phrasing the cue vocabulary ever
+learns.
+
+**Rejected: stripping the page's words out of the title.** `NO CLASS: Labor
+Day - no class` reads redundantly, and `NO CLASS: Labor Day` would read better.
+But the title is the page's own text everywhere else in this program, stripping
+it can leave a row with no title at all, and the redundancy is not what harms
+anybody.
+
+**Rejected: promoting `unknown` pages too.** A page with no established
+convention is not a page whose dates are known to be class meetings, and
+"cancelled" there could be about anything.
+
+**Rejected: keeping it inside `lecture` with a `[?]` and a better reason
+string.** The reason string is in the `DESCRIPTION`, which nobody opens; the
+`[?]` is in the `SUMMARY`, which is the whole of what a phone shows. The fix
+had to be visible where the mistake was.
+
+**Cost, accepted and stated.** `kind` is part of the UID hash, so the two rows
+that change from `lecture` to `no_class` rotate their UIDs once. Subscribers
+see one delete and one add per affected row. This is a one-off, and it is
+listed in the README's upgrade note next to the lecture-key rotation so a user
+reads about both at once.
 
 ---
 
@@ -306,7 +405,7 @@ weekday is as likely to be the stale half as the date is.
 ## 7. Event identity: each kind keyed on the half that holds still
 
 ```
-lecture           uid = sha256("<url>\0<date>\0<kind>")[:32]  + "@course-schedule-ics"
+lecture, no_class uid = sha256("<url>\0<date>\0<kind>")[:32]  + "@course-schedule-ics"
 everything else   uid = sha256("<url>\0<title>\0<kind>")[:32] + "@course-schedule-ics"
 ambiguous         ... with the other half appended, then a "\0#N" tiebreaker
 ```
@@ -356,6 +455,15 @@ one:
   unrelated one appeared"** — which is the exact confusion this program is
   built to prevent. The subject matter really did slide from the Sep 02 slot
   into the Sep 09 slot; nothing in a title comparison can see that.
+
+`no_class` (§4b) is date-keyed for the same reason a lecture is: a holiday row
+is a slot on the lecture schedule that happens to be empty, and its identity is
+the day. Because `kind` is in the hash, a row that changes from `lecture` to
+`no_class` rotates its UID once — a one-off, listed in the README's upgrade
+note. It also means a rotated *title* that carries a "no class" onto another
+date is not a mere retitle: that day has genuinely changed what it is, and the
+UID follows. `tests/test_fetch_and_cli.py` asserts exactly which four of the
+thirty lecture-page rows this affects when every title is rotated by one.
 
 `unknown` keeps the title key. It is the kind that exists precisely because the
 page stated no convention, so there is nothing to justify assuming its dates are
@@ -442,14 +550,19 @@ uncued left-hand date was previously labelled `kind: unknown` (6 records) — a
 placeholder that told the reader nothing, on a page that had already explained
 itself.
 
-**Decision.** Four kinds:
+**Decision.** Five kinds (`no_class` was added later, §4b):
 
 | kind | meaning | ICS `SUMMARY` | time |
 |------|---------|---------------|------|
 | `lecture` | a class meeting | *(title only)* | all-day |
 | `assignment_out` | the day it is handed out | `ASSIGNED: <title>` | all-day |
 | `assignment_due` | the deadline | `DUE: <title>` | 23:59 |
+| `no_class` | a listed day on which the class does not meet | `NO CLASS: <title>` | all-day |
 | `unknown` | retained for a source whose convention is not established | *(title only)* | all-day |
+
+`no_class` is the one kind a config file cannot select as a page default: it is
+derived per row, from the row's own wording, and no page consists only of days
+when nothing happens.
 
 The prefixes are load-bearing, not decoration. The release and the deadline of
 one assignment share a title and land in the same calendar about a fortnight
@@ -511,6 +624,70 @@ alarm can only fire at one end.
 
 **Rejected: dropping the release dates.** They are on the page and they are
 useful — they are when the material becomes available.
+
+### 8b. Which kinds get a reminder
+
+**The report.** The same screenshot as §4b. Measured on the live feed:
+
+| kind | events | reminders |
+|---|---|---|
+| `assignment_due` | 6 | 6 |
+| `assignment_out` | 6 | 6 |
+| `lecture` | 30 | 30 |
+| **total** | **42** | **42** |
+
+Every event carried a `VALARM`, because `build_event` appended one
+unconditionally. Six of those 42 were deadlines. The other 36 told a student to
+attend lectures already on a fixed weekly timetable, and to note that an
+assignment had been handed out — a fact he learns by opening the assignment.
+
+**Why that is a bug and not a preference.** A reminder stream that is 86% noise
+is not merely annoying; it trains the reader to dismiss the notification
+without looking, and the six it costs when that happens are the six that matter.
+This is the same failure the exit codes are designed around (§10): an alarm
+that fires when nothing is wrong stops being read, and then does not work when
+something is.
+
+**Decision.** Reminders follow the `kind`, and the mapping is configurable.
+`ics.alarm_lead(cfg, kind)` is the single place the policy is read; it returns
+`None` for "no `VALARM` at all", and otherwise a lead in days.
+
+| kind | default | why |
+|---|---|---|
+| `assignment_due` | **on** | a deadline is the one thing that passes without announcing itself |
+| `assignment_out` | off | the work cannot begin before it exists; advance warning is meaningless |
+| `lecture` | off | already known, and recurring |
+| `no_class` | off | worth *seeing* in the calendar, not worth an interruption |
+| `unknown` | **on** | conservative: a date whose meaning the parser could not establish is the last one to silence |
+
+Same shape as the UID rule in §7: one decision, taken per kind, because the
+kinds are genuinely different and one answer for all of them had to be wrong
+for most.
+
+**It is a default, not a decision taken for the user.** This is an open-source
+tool and the defaults encode one person's course page. `[alarms]` in the config
+sets each kind independently to `off`, `on`, or a lead in days;
+`lecture = 1` restores the previous behaviour exactly. `alarm_days_before`
+keeps its old meaning as the default lead for whichever kinds have a reminder,
+which is what leaves `--alarm-days` doing what it always did.
+
+**Rejected: `0` as the off switch.** A lead of zero days is a setting somebody
+wants — "remind me at the event itself" — and reading it as false would delete
+their reminder while looking like it obeyed them. The off switch is a word
+(`off`/`no`/`none`/`false`/`never`).
+
+**Rejected: a global `alarms = due-only` mode.** Three or four named modes
+would cover the common cases and none of the others, and a user wanting
+"lectures too, but a week ahead" would have to patch the source. Per-kind
+settings are barely more code and have no such edge.
+
+**Consequence for `deploy.sh`.** Its structure gate asserted "one `VALARM` per
+`VEVENT`", which under this change would block every publish. It now derives
+the alarm-bearing kinds from the config through `ics.alarm_lead` — the parser's
+own policy, not a second copy of it — and checks each event against its
+`CATEGORIES` line. It fails both on an event that should have a reminder and
+does not, and on one that carries a reminder the policy does not call for; the
+original check only caught the first.
 
 ---
 
@@ -773,7 +950,7 @@ under test; the socket block covers the code nobody thought about.
   rather than publish records it knows were parsed under different rules.
   Code 6 rather than 2 because nothing about the fetch failed. `--alarm-days` is
   deliberately *not* in the signature: it changes the ICS, not the parse.
-- **Everything tunable lives in `config.py`** — anchor, alarm lead, default due
+- **Everything tunable lives in `config.py`** — anchor, alarm policy, default due
   time, shrink thresholds, calendar name, sources — and everything
   course-specific among those comes from the config file rather than the
   source. Nothing tunable is hardcoded elsewhere. See §15.
@@ -796,6 +973,37 @@ under test; the socket block covers the code nobody thought about.
 Found by audit, deliberately not fixed. Each is a real defect; each is here
 because the fix costs more than the defect, or because the fix is a product
 decision rather than a bug fix.
+
+### An unusually worded cancellation is missed
+
+`NO_CLASS_RE` reads explicit statements and `RECESS_TITLE_RE` a closed list of
+recess names anchored to the whole title (§4b). A row reading only `Labor Day`,
+or one that strikes its topic through in HTML, or a page that writes
+`class → asynchronous`, stays an ordinary `lecture` — in the last case a
+`certain` one, with nothing to flag.
+
+Not fixed, because this is the direction the rule is deliberately wrong in. The
+cost of a miss is the `[?]` lecture the reader already had; the cost of a false
+positive is a student who does not turn up to a class that is running. Widening
+the vocabulary trades a cheap failure for an expensive one, and the words that
+would have to be added — a bare holiday name, `break` unanchored — are exactly
+the ambiguous ones.
+
+### A class that moved is flagged, not followed
+
+`moved to`, `rescheduled` and `postponed` veto the `no_class` promotion (§4b),
+so the row stays a `[?]` lecture on its original date. The class does happen;
+this program does not say where. Resolving it would mean reading a destination
+out of free prose ("moved to the following Tuesday", "see Brightspace"), which
+is the class of guess §2 and §5 exist to refuse.
+
+### A `no_class` row keeps the page's redundant wording
+
+`NO CLASS: Labor Day - no class` says it twice. Stripping the matched phrase
+out of the title would read better and would cost nothing in identity terms —
+`no_class` is date-keyed (§7), so the title is not in its UID — but the title
+is the page's own text everywhere else in this program, and stripping can leave
+a row with no title at all (`Oct. 12 No class`). The redundancy harms nobody.
 
 ### A lecture that changes date is a delete plus an add
 

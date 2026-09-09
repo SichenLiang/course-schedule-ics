@@ -4,7 +4,8 @@ import unittest
 
 from courseics.config import Config, fall_anchor
 from courseics.parse import (CERTAIN, KIND_ASSIGNMENT_DUE, KIND_ASSIGNMENT_OUT,
-                           KIND_LECTURE, UNCERTAIN, parse_line)
+                           KIND_LECTURE, KIND_NO_CLASS, KIND_UNKNOWN,
+                           UNCERTAIN, parse_line)
 
 URL = "https://example.invalid/page"
 
@@ -186,13 +187,15 @@ class TestNegationAndCorrection(unittest.TestCase):
     def test_rescheduled(self):
         self._uncertain("Sep. 02, 2026 Intro rescheduled")
 
-    def test_cancelled_both_spellings(self):
-        self._uncertain("Sep. 02, 2026 Intro cancelled")
-        self._uncertain("Sep. 02, 2026 Intro canceled")
-
-    def test_no_class(self):
-        r = self._uncertain("Sep. 07, 2026 Labor Day - no class")
-        self.assertTrue(any("no class" in x for x in r.reasons), r.reasons)
+    def test_a_cancellation_is_not_a_doubt(self):
+        # Both spellings used to land here, alongside "TBD" and "may change".
+        # They do not belong together: "cancelled" is the page being certain.
+        # See TestNoClassIsADefiniteStatement for where they went.
+        for line in ("Sep. 02, 2026 Intro cancelled",
+                     "Sep. 02, 2026 Intro canceled"):
+            r = one(line)
+            self.assertEqual(r.confidence, CERTAIN, line)
+            self.assertEqual(r.kind, KIND_NO_CLASS, line)
 
     def test_tbd(self):
         self._uncertain("Sep. 02, 2026 Guest lecture TBD")
@@ -200,6 +203,154 @@ class TestNegationAndCorrection(unittest.TestCase):
     def test_relative_expression(self):
         r = self._uncertain("Sep. 02, 2026 Intro, details next week")
         self.assertTrue(any("relative" in x for x in r.reasons), r.reasons)
+
+
+class TestNoClassIsADefiniteStatement(unittest.TestCase):
+    """A day the page says the class does not meet is not a doubtful lecture.
+
+    Both lines below are real rows from the recorded lecture page, and both
+    were published as `[?] Labor Day - no class` / `[?] Fall break - No class`
+    -- the `[?]` meaning "this program could not work out what this row is".
+    It could. The row says so.
+    """
+
+    def test_the_recorded_labor_day_row(self):
+        r = one("Sep. 07, 2026 Labor Day - no class")
+        self.assertEqual(r.kind, KIND_NO_CLASS)
+        self.assertEqual(r.confidence, CERTAIN)
+
+    def test_the_recorded_fall_break_row(self):
+        r = one("Oct. 12, 2026 Fall break - No class")
+        self.assertEqual(r.kind, KIND_NO_CLASS)
+        self.assertEqual(r.confidence, CERTAIN)
+
+    def test_the_reason_names_the_phrase_it_read(self):
+        r = one("Sep. 07, 2026 Labor Day - no class")
+        self.assertTrue(any("does not meet" in x for x in r.reasons),
+                        r.reasons)
+        self.assertTrue(any("no class" in x for x in r.reasons), r.reasons)
+
+    def test_the_phrase_that_produced_it_no_longer_also_doubts_it(self):
+        # "no class" is in NEGATION_RE, which is what made the row uncertain.
+        # A record produced BY that phrase may not also be downgraded by it.
+        r = one("Sep. 07, 2026 Labor Day - no class")
+        self.assertFalse(any("negation/correction" in x for x in r.reasons),
+                         r.reasons)
+
+    def test_other_spellings_of_the_same_statement(self):
+        for line in ("Oct. 12, 2026 No classes",
+                     "Oct. 12, 2026 No lecture",
+                     "Oct. 12, 2026 No lab",
+                     "Oct. 12, 2026 Lecture cancelled",
+                     "Oct. 12, 2026 Class canceled",
+                     "Oct. 12, 2026 Class does not meet",
+                     "Oct. 12, 2026 We will not meet"):
+            r = one(line)
+            self.assertEqual(r.kind, KIND_NO_CLASS, line)
+            self.assertEqual(r.confidence, CERTAIN, line)
+
+    def test_a_named_recess_standing_as_the_whole_title(self):
+        for line in ("Nov. 26, 2026 Thanksgiving break",
+                     "Oct. 12, 2026 Fall Break",
+                     "Mar. 16, 2027 Spring recess",
+                     "Nov. 27, 2026 Holiday",
+                     "Dec. 24, 2026 Winter vacation"):
+            r = one(line)
+            self.assertEqual(r.kind, KIND_NO_CLASS, line)
+            self.assertEqual(r.confidence, CERTAIN, line)
+
+    def test_a_date_still_carries_its_own_doubts(self):
+        # The cancellation is certain; the DATE is what a weekday conflict
+        # casts doubt on, and the two judgements are independent. Sep 7 2026
+        # is a Monday.
+        r = one("Fri Sep. 07, 2026 Labor Day - no class")
+        self.assertEqual(r.kind, KIND_NO_CLASS)
+        self.assertEqual(r.confidence, UNCERTAIN)
+
+    def test_an_unrelated_negation_word_still_downgrades_it(self):
+        # Only the words that PRODUCED the record are excused. "not" here is
+        # about the notes, and it is still a reason to look.
+        r = one("Sep. 07, 2026 Labor Day - no class, notes not posted")
+        self.assertEqual(r.kind, KIND_NO_CLASS)
+        self.assertEqual(r.confidence, UNCERTAIN)
+        self.assertTrue(any("negation/correction" in x for x in r.reasons),
+                        r.reasons)
+
+
+class TestNoClassDoesNotOverTrigger(unittest.TestCase):
+    """The expensive mistake is the other one.
+
+    A miss costs the reader the `[?] lecture` they already have and can read.
+    A false positive publishes "NO CLASS" at confidence `certain` over a
+    lecture that is happening, and a student who believes it misses the class.
+    Every rule below therefore declines to fire, and each names the shape of
+    prose it is declining on.
+    """
+
+    def _still_a_lecture(self, line, kind=KIND_LECTURE):
+        r = records(line, kind=kind)[0]
+        self.assertNotEqual(r.kind, KIND_NO_CLASS, line)
+        return r
+
+    def test_an_announcement_stating_a_possibility_not_a_fact(self):
+        # The shape that matters most: a conditional reads word-for-word like
+        # a cancellation and is not one.
+        r = self._still_a_lecture(
+            "Oct. 12, 2026 There will be no class if it snows")
+        self.assertEqual(r.kind, KIND_LECTURE)
+        self.assertEqual(r.confidence, UNCERTAIN)
+        self.assertTrue(any("conditional or provisional" in x
+                            for x in r.reasons), r.reasons)
+
+    def test_other_hedged_shapes(self):
+        for line in ("Oct. 12, 2026 No class unless the strike ends",
+                     "Oct. 12, 2026 Lecture possibly cancelled",
+                     "Oct. 12, 2026 No class, TBD",
+                     "Oct. 12, 2026 Class might be cancelled",
+                     "Oct. 12, 2026 No class in case of snow",
+                     "Oct. 12, 2026 Cancellation tentative, no class"):
+            r = self._still_a_lecture(line)
+            self.assertEqual(r.confidence, UNCERTAIN, line)
+
+    def test_a_cancellation_that_is_denied(self):
+        # The inversion: reading "cancelled" out of "is not cancelled" would
+        # publish NO CLASS over a lecture that is explicitly still on.
+        r = self._still_a_lecture("Oct. 12, 2026 The class is not cancelled")
+        self.assertEqual(r.confidence, UNCERTAIN)
+
+    def test_a_class_that_moved_rather_than_vanished(self):
+        # A moved class still happens, and where it lands is not something
+        # this parser can read off the page. Neither claim is published.
+        r = self._still_a_lecture(
+            "Oct. 12, 2026 Lecture cancelled, moved to the lab")
+        self.assertEqual(r.confidence, UNCERTAIN)
+
+    def test_break_is_an_ordinary_english_word(self):
+        # The reason the recess list is closed and anchored to the whole
+        # title: "break" and "holiday" turn up in perfectly ordinary rows.
+        for line in ("Oct. 12, 2026 Coffee break with the TAs",
+                     "Oct. 12, 2026 Break-out groups on planning",
+                     "Oct. 12, 2026 Holiday lighting: a case study",
+                     "Oct. 12, 2026 How to break a symmetry"):
+            r = self._still_a_lecture(line)
+            self.assertEqual(r.kind, KIND_LECTURE, line)
+            self.assertEqual(r.confidence, CERTAIN, line)
+
+    def test_a_cancelled_assignment_is_not_a_cancelled_class(self):
+        # Only a page whose plain dates ARE class meetings can have a day with
+        # no class on it. On the assignments page this row cancels an
+        # assignment.
+        r = self._still_a_lecture("Oct. 12, 2026 Assignment 4 cancelled",
+                                  kind=KIND_ASSIGNMENT_OUT)
+        self.assertEqual(r.kind, KIND_ASSIGNMENT_OUT)
+
+    def test_a_page_with_no_established_convention_is_left_alone(self):
+        r = self._still_a_lecture("Oct. 12, 2026 No class", kind=KIND_UNKNOWN)
+        self.assertEqual(r.kind, KIND_UNKNOWN)
+
+    def test_a_cued_deadline_is_never_reinterpreted(self):
+        r = self._still_a_lecture("Due Oct. 12, 2026 Assignment 4 cancelled")
+        self.assertEqual(r.kind, KIND_ASSIGNMENT_DUE)
 
 
 class TestAssignmentKinds(unittest.TestCase):
